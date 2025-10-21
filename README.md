@@ -27,7 +27,7 @@ knotify is a command-line tool that watches specified files and directories for 
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone 
 
 # Build the project
 cargo build --release
