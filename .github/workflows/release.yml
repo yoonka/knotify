@@ -69,6 +69,12 @@ jobs:
           tar czf ${{ matrix.artifact_name }}.tar.gz knotify
           mv ${{ matrix.artifact_name }}.tar.gz ${{ github.workspace }}/
 
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ./${{ matrix.artifact_name }}.tar.gz
+
       - name: Upload Release Asset
         uses: actions/upload-release-asset@v1
         env:
@@ -108,6 +114,12 @@ jobs:
           strip knotify
           tar czf ${{ matrix.artifact_name }}.tar.gz knotify
           mv ${{ matrix.artifact_name }}.tar.gz ${{ github.workspace }}/
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ./${{ matrix.artifact_name }}.tar.gz
 
       - name: Upload Release Asset
         uses: actions/upload-release-asset@v1
@@ -149,6 +161,12 @@ jobs:
           zip -j ${{ matrix.artifact_name }}.zip knotify.exe
           mv ${{ matrix.artifact_name }}.zip ${{ github.workspace }}/
 
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ./${{ matrix.artifact_name }}.zip
+
       - name: Upload Release Asset
         uses: actions/upload-release-asset@v1
         env:
@@ -189,6 +207,12 @@ jobs:
           tar czf ${{ matrix.artifact_name }}.tar.gz knotify
           mv ${{ matrix.artifact_name }}.tar.gz ${{ github.workspace }}/
 
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ./${{ matrix.artifact_name }}.tar.gz
+
       - name: Upload Release Asset
         uses: actions/upload-release-asset@v1
         env:
@@ -212,7 +236,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec sha256sum {} \; > SHA256SUMS
+          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec sha256sum {} \; | sed 's|^\./||' | sed 's|.*/||' > SHA256SUMS
           cat SHA256SUMS
 
       - name: Upload checksums
