@@ -67,7 +67,7 @@ pub struct Config {
     pub recursive: bool,
     // pub backend: Backend,
     pub json_output: bool,
-    // pub debounce_ms: u64,
+    pub debounce_ms: u64,
     // pub log_level: LogLevel,
     // pub once: bool,
     pub filters: Option<Vec<EventFilter>>,
@@ -109,7 +109,7 @@ impl Config {
             //     _ => Backend::Auto,
             // },
             json_output: args.json,
-            // debounce_ms: args.debounce,
+            debounce_ms: args.debounce,
             // log_level: match args.log.as_str() {
             //     "error" => LogLevel::Error,
             //     "warn" => LogLevel::Warn,
