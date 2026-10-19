@@ -1,0 +1,31 @@
+name: Native protocol and reconciliation
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  native:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+  freebsd-zfs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/freebsd-vm@v1.5.9
+        with:
+          release: '15.0'
+          mem: 4096
+          prepare: pkg install -y rust
+          run: |
+            set -eu
+            kldload zfs || true
+            truncate -s 1G /tmp/knotify-test.vdev
+            zpool create -m /tmp/knotify-zfs knotify_test /tmp/knotify-test.vdev
+            trap 'zpool destroy knotify_test' EXIT
+            mkdir /tmp/knotify-zfs/tmp
+            TMPDIR=/tmp/knotify-zfs/tmp cargo test --locked

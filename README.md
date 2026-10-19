@@ -1,5 +1,8 @@
 # knotify
 
+For the opt-in lossless ETF watcher and SQLite reconciliation service, see
+[the protocol guide](docs/protocol.md). The legacy JSON CLI remains available.
+
 A cross-platform file system watcher utility built with Rust that monitors file and directory changes in real-time.
 
 ## Overview
