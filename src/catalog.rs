@@ -79,8 +79,11 @@ impl Catalog {
             };
             (id, marker)
         } else {
-            if conn.query_row("SELECT count(*) FROM root_info", [], |r| r.get::<_, i64>(0))? != 0 {
-                return Err("incomplete root enrollment".into());
+            if conn.query_row("SELECT count(*) FROM root_info", [], |r| r.get::<_, i64>(0))? != 0
+                || conn.query_row("SELECT count(*) FROM files", [], |r| r.get::<_, i64>(0))? != 0
+                || conn.query_row("SELECT count(*) FROM dirs", [], |r| r.get::<_, i64>(0))? != 1
+            {
+                return Err("incomplete root enrollment: catalog is not empty".into());
             }
             let path = root.join(".aaryx-root");
             let marker = match read_marker(&path) {
@@ -136,8 +139,8 @@ impl Catalog {
         }
         let excluded = excluded
             .into_iter()
-            .filter_map(|p| fs::canonicalize(p).ok())
-            .collect();
+            .map(|p| exclusion_path(&p))
+            .collect::<io::Result<Vec<_>>>()?;
         let catalog = Self {
             root,
             database: database.to_path_buf(),
@@ -401,6 +404,35 @@ impl Catalog {
         Ok(())
     }
 }
+fn exclusion_path(path: &Path) -> io::Result<PathBuf> {
+    // Keep policies for state directories created after enrollment. Resolve the
+    // existing ancestor so Windows verbatim prefixes and directory aliases match
+    // the canonical root; never silently discard an absent exclusion.
+    let mut ancestor = std::path::absolute(path)?;
+    let mut suffix = vec![];
+    loop {
+        match fs::canonicalize(&ancestor) {
+            Ok(mut resolved) => {
+                for part in suffix.into_iter().rev() {
+                    resolved.push(part);
+                }
+                return Ok(resolved);
+            }
+            Err(e) if native::absent(&e) => {
+                suffix.push(
+                    ancestor
+                        .file_name()
+                        .ok_or_else(|| io::Error::other("invalid exclusion path"))?
+                        .to_os_string(),
+                );
+                if !ancestor.pop() {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
 fn read_marker(path: &Path) -> io::Result<String> {
     if native::alias(&fs::symlink_metadata(path)?) {
         return Err(io::Error::other("root marker is a path alias"));
@@ -651,6 +683,45 @@ mod tests {
     #[test]
     fn a_second_owner_is_rejected() {
         let (r, d, _c) = fixture();
+        assert!(Catalog::open(r.path(), &d.path().join("catalog.sqlite3"), vec![]).is_err());
+    }
+    #[test]
+    fn absent_exclusions_remain_excluded_when_the_directory_appears() {
+        let r = tempfile::tempdir().unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let excluded = r.path().join("future-state").join("cache");
+        let c = Catalog::open(
+            r.path(),
+            &d.path().join("catalog.sqlite3"),
+            vec![excluded.clone()],
+        )
+        .unwrap();
+        fs::create_dir_all(&excluded).unwrap();
+        fs::write(excluded.join("internal"), b"x").unwrap();
+        let mut out = vec![];
+        c.request(
+            &Value::map([
+                ("op", "reconcile_dir".into()),
+                ("path", b"future-state".to_vec().into()),
+            ]),
+            |v| {
+                out.push(v);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(out.is_empty());
+    }
+    #[test]
+    fn indexed_rows_without_enrollment_are_never_adopted() {
+        let (r, d, c) = fixture();
+        fs::write(r.path().join("a"), b"x").unwrap();
+        seed(&c, b"a", 1);
+        Connection::open(&c.database)
+            .unwrap()
+            .execute("DELETE FROM root_info", [])
+            .unwrap();
+        drop(c);
         assert!(Catalog::open(r.path(), &d.path().join("catalog.sqlite3"), vec![]).is_err());
     }
     #[test]
