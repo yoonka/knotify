@@ -35,11 +35,14 @@ pub fn run(
     let (tx, rx) = mpsc::sync_channel(CAPACITY);
     let overflow = Arc::new(AtomicBool::new(false));
     let lost = Arc::clone(&overflow);
-    let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
-        if tx.try_send(event).is_err() {
-            lost.store(true, Ordering::Release);
-        }
-    })?;
+    let mut watcher = notify::RecommendedWatcher::new(
+        move |event: notify::Result<Event>| {
+            if tx.try_send(event).is_err() {
+                lost.store(true, Ordering::Release);
+            }
+        },
+        notify::Config::default().with_follow_symlinks(false),
+    )?;
     let mut output = io::stdout().lock();
     if let Err(e) = watcher.watch(
         &root,
