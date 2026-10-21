@@ -214,42 +214,17 @@ impl Catalog {
         let (parent, name) = split(path);
         Ok(conn.query_row("SELECT f.size,f.mtime_ns,f.ctime_ns,f.ino,f.content_status FROM files f JOIN dirs d ON d.dir_id=f.dir_id WHERE d.path=?1 AND f.name=?2",params![parent,name],|r|Ok(Stored { kind:"file",size:r.get(0)?,mtime:r.get(1)?,ctime:r.get(2)?,ino:r.get(3)?,status:r.get(4)? })).optional()?)
     }
-    fn children(conn: &Connection, path: &[u8]) -> Result<BTreeMap<Vec<u8>, Stored>> {
-        let mut result = BTreeMap::new();
-        let mut s=conn.prepare("SELECT f.name,f.size,f.mtime_ns,f.ctime_ns,f.ino,f.content_status FROM files f JOIN dirs d ON d.dir_id=f.dir_id WHERE d.path=?1")?;
-        for item in s.query_map([path], |r| {
-            Ok((
-                r.get::<_, Vec<u8>>(0)?,
-                Stored {
-                    kind: "file",
-                    size: r.get(1)?,
-                    mtime: r.get(2)?,
-                    ctime: r.get(3)?,
-                    ino: r.get(4)?,
-                    status: r.get(5)?,
-                },
-            ))
-        })? {
-            let (k, v) = item?;
-            result.insert(k, v);
-        }
-        let mut s = conn.prepare(
-            "SELECT d.name FROM dirs d JOIN dirs p ON p.dir_id=d.parent_id WHERE p.path=?1",
-        )?;
-        for item in s.query_map([path], |r| r.get::<_, Vec<u8>>(0))? {
-            result.insert(
-                item?,
-                Stored {
-                    kind: "dir",
-                    size: 0,
-                    mtime: 0,
-                    ctime: 0,
-                    ino: None,
-                    status: 0,
-                },
-            );
-        }
-        Ok(result)
+    fn children(conn: &Connection) -> Result<rusqlite::Statement<'_>> {
+        // SQLite merges the two indexed name orders. Retain only the current
+        // catalog child, not another complete copy of a large directory.
+        Ok(conn.prepare(
+            "SELECT name,0 AS kind,size,mtime_ns,ctime_ns,ino,content_status
+             FROM files WHERE dir_id=(SELECT dir_id FROM dirs WHERE path=?1)
+             UNION ALL
+             SELECT name,1,0,0,0,NULL,0
+             FROM dirs WHERE parent_id=(SELECT dir_id FROM dirs WHERE path=?1)
+             ORDER BY name",
+        )?)
     }
     fn compare(
         &self,
@@ -273,7 +248,9 @@ impl Catalog {
             ))?;
         }
         match actual {
-            Some(s) if s.kind == "dir" => emit(directory(path)),
+            Some(s) if s.kind == "dir" => {
+                emit(directory(path, old.is_none_or(|entry| entry.kind != "dir")))
+            }
             Some(s) if s.kind == "file" => {
                 let same = old.is_some_and(|o| {
                     o.kind == "file"
@@ -319,29 +296,61 @@ impl Catalog {
         }
         // Finish enumeration before inferring absence. An entry stat failure is
         // unknown, not missing; a read_dir failure rejects the entire listing.
-        let mut listing = BTreeMap::new();
-        for entry in fs::read_dir(&full)? {
-            let entry = entry?;
-            let name = native::encode(&entry.file_name());
-            let p = entry.path();
-            let s = native::stamp(&p);
-            listing.insert(
-                name,
-                s.map(|s| if self.ignored(&p, &s) { None } else { Some(s) }),
-            );
-        }
+        let listing = native::listing(&full)?;
         self.check_root()?;
-        let mut old = Self::children(conn, path)?;
+        let mut statement = Self::children(conn)?;
+        let mut old = statement.query_map([path], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                Stored {
+                    kind: if row.get::<_, i64>(1)? == 0 {
+                        "file"
+                    } else {
+                        "dir"
+                    },
+                    size: row.get(2)?,
+                    mtime: row.get(3)?,
+                    ctime: row.get(4)?,
+                    ino: row.get(5)?,
+                    status: row.get(6)?,
+                },
+            ))
+        })?;
+        let mut previous = old.next().transpose()?;
         for (name, stat) in listing {
+            while previous.as_ref().is_some_and(|(key, _)| key < &name) {
+                let (missing, stored) = previous.take().unwrap();
+                self.compare(&native::join(path, &missing), None, Some(&stored), emit)?;
+                previous = old.next().transpose()?;
+            }
+            let stored = if previous.as_ref().is_some_and(|(key, _)| key == &name) {
+                let (_, stored) = previous.take().unwrap();
+                previous = old.next().transpose()?;
+                Some(stored)
+            } else {
+                None
+            };
             let child = native::join(path, &name);
-            let previous = old.remove(&name);
             match stat {
-                Ok(s) => self.compare(&child, s.as_ref(), previous.as_ref(), emit)?,
+                Ok(s) => {
+                    let full = full.join(native::decode(&name)?);
+                    self.compare(
+                        &child,
+                        if self.ignored(&full, &s) {
+                            None
+                        } else {
+                            Some(&s)
+                        },
+                        stored.as_ref(),
+                        emit,
+                    )?;
+                }
                 Err(e) => emit(unknown(&child, &e))?,
             }
         }
-        for (name, previous) in old {
-            self.compare(&native::join(path, &name), None, Some(&previous), emit)?;
+        while let Some((name, stored)) = previous {
+            self.compare(&native::join(path, &name), None, Some(&stored), emit)?;
+            previous = old.next().transpose()?;
         }
         Ok(())
     }
@@ -359,7 +368,8 @@ impl Catalog {
             let full = match native::resolve(&self.root, path) {
                 Ok(p) => p,
                 Err(e) if e.kind() == io::ErrorKind::Unsupported => {
-                    emit(directory(split(path).0))?;
+                    let parent = split(path).0;
+                    emit(directory(parent, Self::lookup(conn, parent)?.is_none()))?;
                     continue;
                 }
                 Err(e) => return Err(e.into()),
@@ -367,7 +377,11 @@ impl Catalog {
             let old = Self::lookup(conn, path)?;
             match native::stamp(&full) {
                 Ok(s) if self.ignored(&full, &s) => self.compare(path, None, old.as_ref(), emit)?,
-                Ok(_s) if old.is_none() => emit(directory(split(path).0))?, // listing supplies authoritative spelling
+                Ok(_s) if old.is_none() => {
+                    // A listing supplies the authoritative spelling.
+                    let parent = split(path).0;
+                    emit(directory(parent, Self::lookup(conn, parent)?.is_none()))?;
+                }
                 Ok(s) => self.compare(path, Some(&s), old.as_ref(), emit)?,
                 Err(e) if native::absent(&e) => self.compare(path, None, old.as_ref(), emit)?,
                 Err(e) => emit(unknown(path, &e))?,
@@ -451,8 +465,12 @@ fn split(path: &[u8]) -> (&[u8], &[u8]) {
         None => (b"", path),
     }
 }
-fn directory(path: &[u8]) -> Value {
-    Value::map([("type", "directory".into()), ("path", path.to_vec().into())])
+fn directory(path: &[u8], discovered: bool) -> Value {
+    Value::map([
+        ("type", "directory".into()),
+        ("path", path.to_vec().into()),
+        ("discovered", Value::Bool(discovered)),
+    ])
 }
 fn change(op: &str, path: &[u8], s: Option<&Stamp>) -> Value {
     Value::map([
@@ -679,6 +697,62 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].get("op").unwrap().bytes().unwrap(), b"delete");
         assert_eq!(out[1].get("type").unwrap().bytes().unwrap(), b"directory");
+        assert_eq!(out[1].get("discovered").unwrap(), &Value::Bool(true));
+    }
+
+    #[test]
+    fn ordered_catalog_merge_preserves_known_and_new_directory_semantics() {
+        let (r, _d, c) = fixture();
+        for name in ["a-missing", "c-changed", "z-unchanged"] {
+            fs::write(r.path().join(name), b"original").unwrap();
+            seed(&c, name.as_bytes(), name.as_bytes()[0] as i64);
+        }
+        fs::remove_file(r.path().join("a-missing")).unwrap();
+        fs::write(r.path().join("c-changed"), b"different size").unwrap();
+        fs::write(r.path().join("b-new"), b"new").unwrap();
+        fs::create_dir(r.path().join("d-known")).unwrap();
+        fs::create_dir(r.path().join("e-new")).unwrap();
+        let db = Connection::open(&c.database).unwrap();
+        db.execute(
+            "INSERT INTO dirs VALUES(2,1,?1,?1)",
+            [b"d-known".as_slice()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO dirs VALUES(3,1,?1,?1)",
+            [b"f-missing".as_slice()],
+        )
+        .unwrap();
+        let out = scan(&c);
+        let paths: Vec<_> = out
+            .iter()
+            .map(|v| v.get("path").unwrap().bytes().unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                b"a-missing".as_slice(),
+                b"b-new",
+                b"c-changed",
+                b"d-known",
+                b"e-new",
+                b"f-missing"
+            ]
+        );
+        assert_eq!(out[0].get("op").unwrap().bytes().unwrap(), b"delete");
+        assert_eq!(out[1].get("op").unwrap().bytes().unwrap(), b"upsert");
+        assert_eq!(out[2].get("op").unwrap().bytes().unwrap(), b"upsert");
+        assert_eq!(out[3].get("discovered").unwrap(), &Value::Bool(false));
+        assert_eq!(out[4].get("discovered").unwrap(), &Value::Bool(true));
+        assert_eq!(
+            out[5].get("op").unwrap().bytes().unwrap(),
+            b"delete_subtree"
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM files", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
     }
     #[test]
     fn a_second_owner_is_rejected() {

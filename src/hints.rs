@@ -184,7 +184,9 @@ pub fn run(
 }
 
 fn absorb(root: &std::path::Path, event: Event, paths: &mut BTreeSet<Vec<u8>>, rescan: &mut bool) {
-    if event.need_rescan() {
+    if event.need_rescan()
+        || (event.paths.is_empty() && matches!(event.kind, EventKind::Any | EventKind::Other))
+    {
         *rescan = true;
     }
     if matches!(
@@ -215,6 +217,27 @@ fn absorb(root: &std::path::Path, event: Event, paths: &mut BTreeSet<Vec<u8>>, r
 mod tests {
     use super::*;
     use notify::event::{AccessKind, CreateKind, Flag, RemoveKind};
+    #[test]
+    fn unscoped_ambiguous_events_require_a_rescan() {
+        let root = PathBuf::from("root");
+        for kind in [EventKind::Any, EventKind::Other] {
+            let mut paths = BTreeSet::new();
+            let mut rescan = false;
+            absorb(&root, Event::new(kind), &mut paths, &mut rescan);
+            assert!(rescan);
+            assert!(paths.is_empty());
+        }
+        let mut paths = BTreeSet::new();
+        let mut rescan = false;
+        absorb(
+            &root,
+            Event::new(EventKind::Any).add_path(root.join("known")),
+            &mut paths,
+            &mut rescan,
+        );
+        assert!(!rescan);
+        assert!(paths.contains(b"known".as_slice()));
+    }
     #[test]
     fn recreate_is_retained_and_access_rescan_is_never_filtered() {
         let root = PathBuf::from("root");

@@ -49,6 +49,8 @@ The callback has a 4,096-event nonblocking channel and the coalescer has a
 4,096-path limit. Either overflow retains a rescan requirement. Access-only
 events are omitted; a rescan flag is processed before filtering. Renames and
 delete/create pairs are path hints, never inferred final actions.
+An `Any` or `Other` event without paths also requires a whole-root rescan,
+even when notify has not set its explicit rescan flag.
 
 ## Catalog
 
@@ -73,12 +75,28 @@ batch must be acknowledged before that request emits another; acknowledgement
 expires after 60 seconds. Two workers service requests, with a hard four-request
 native limit; Aaryx limits itself to two.
 
-Items are `directory` (`path`), `change` (`path`, `op`, `stat`) or `unknown`
+Items are `directory` (`path`, boolean `discovered`), `change` (`path`, `op`, `stat`) or `unknown`
 (`path`, `error`). Change operations are `upsert`, `delete`, `delete_subtree`.
+`discovered` distinguishes a directory absent from the catalog (or replacing
+a file) from an existing catalog directory. New discoveries have scheduling
+priority 0; existing directories inherit the reconciliation pass's priority.
 Observed metadata is advisory. Unknown entries and failed enumeration never
 prove absence. Native root identity is checked before and after reconciliation
 and before emitting batches. Own state, `.aaryx-*`, `.zfs`, links/reparse points
 and other filesystem volumes are excluded.
+
+Directory reconciliation completes and sorts one on-disk listing, then merges
+it with an ordered SQLite cursor over catalog files and subdirectories. It
+retains only the current catalog child. Memory still scales with the complete
+disk listing of each active directory; bounded output is not a constant-memory
+directory walk. A failed listing produces no removals.
+
+Windows uses 64 KiB `FileIdExtdDirectoryInfo` batches on a single directory
+handle. This is the 128-bit file-ID variant of the design's bulk
+`FileIdBothDirectoryInfo` operation: it preserves compatibility with the
+existing `FileIdInfo` identity keys while returning size, modification time,
+and ChangeTime without opening each child. Unsupported or incomplete bulk
+enumeration fails reconciliation rather than silently inferring removals.
 
 The catalog contains `root_info`, `dirs` and `files`; `files` is keyed by binary
 directory/name and has a unique root-local integer `file_id`, size/timestamps,
