@@ -247,12 +247,100 @@ mod root_tests {
 
 #[cfg(unix)]
 pub fn listing(path: &Path) -> io::Result<Listing> {
-    let mut listing = BTreeMap::new();
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        listing.insert(encode(&entry.file_name()), stamp(&entry.path()));
+    use std::{
+        ffi::{CStr, CString},
+        os::fd::IntoRawFd,
+        os::unix::fs::OpenOptionsExt,
+    };
+    // fdopendir owns the descriptor after success. Every stat stays relative
+    // to this opened directory even if its pathname is renamed concurrently.
+    let fd = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?
+        .into_raw_fd();
+    let ptr = unsafe { libc::fdopendir(fd) };
+    if ptr.is_null() {
+        let e = io::Error::last_os_error();
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(e);
     }
-    Ok(listing)
+    struct Directory(*mut libc::DIR);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+    let directory = Directory(ptr);
+    let mut listing = BTreeMap::new();
+    loop {
+        // readdir distinguishes end-of-directory from an incomplete listing
+        // through errno, which must be cleared before each call.
+        unsafe {
+            *errno_ptr() = 0;
+        }
+        let entry = unsafe { libc::readdir(directory.0) };
+        if entry.is_null() {
+            let code = unsafe { *errno_ptr() };
+            return if code == 0 {
+                Ok(listing)
+            } else {
+                Err(io::Error::from_raw_os_error(code))
+            };
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let name = CString::from(name);
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        let result =
+            if unsafe { libc::fstatat(fd, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) }
+                == 0
+            {
+                Ok(Stamp {
+                    kind: match stat.st_mode & libc::S_IFMT {
+                        libc::S_IFDIR => "dir",
+                        libc::S_IFREG => "file",
+                        _ => "other",
+                    },
+                    size: stat.st_size as i64,
+                    mtime_ns: (stat.st_mtime as i64)
+                        .saturating_mul(1_000_000_000)
+                        .saturating_add(stat.st_mtime_nsec as i64),
+                    ctime_ns: (stat.st_ctime as i64)
+                        .saturating_mul(1_000_000_000)
+                        .saturating_add(stat.st_ctime_nsec as i64),
+                    id: (stat.st_ino as u64).to_be_bytes().to_vec(),
+                    volume: (stat.st_dev as u64).to_be_bytes().to_vec(),
+                })
+            } else {
+                Err(io::Error::last_os_error())
+            };
+        listing.insert(name.as_bytes().to_vec(), result);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe fn errno_ptr() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "dragonfly"
+))]
+unsafe fn errno_ptr() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+#[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+unsafe fn errno_ptr() -> *mut libc::c_int {
+    unsafe { libc::__errno() }
 }
 
 #[cfg(windows)]
@@ -517,7 +605,7 @@ pub fn resolve(root: &Path, relative: &[u8]) -> io::Result<PathBuf> {
                 return Err(io::Error::new(io::ErrorKind::Unsupported, "path alias"));
             }
             Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) if absent(&e) => {}
             Err(e) => return Err(e),
         }
     }

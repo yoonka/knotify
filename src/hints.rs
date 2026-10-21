@@ -37,10 +37,7 @@ pub fn run(
     let lost = Arc::clone(&overflow);
     let mut watcher = notify::RecommendedWatcher::new(
         move |event: notify::Result<Event>| {
-            if event
-                .as_ref()
-                .is_ok_and(|e| matches!(e.kind, EventKind::Access(_)) && !e.need_rescan())
-            {
+            if event.as_ref().is_ok_and(access_only) {
                 return;
             }
             if tx.try_send(event).is_err() {
@@ -108,6 +105,7 @@ pub fn run(
     let mut paths = BTreeSet::new();
     let mut rescan = false;
     let mut error: Option<String> = None;
+    let mut error_paths = BTreeSet::new();
     let mut seq = 0i64;
     let mut last = Instant::now();
     loop {
@@ -130,7 +128,25 @@ pub fn run(
                 }
                 Ok(Err(e)) => {
                     error = Some(e.to_string());
-                    rescan = true;
+                    if e.paths.is_empty() {
+                        rescan = true;
+                    }
+                    for path in e.paths {
+                        match path
+                            .strip_prefix(&root)
+                            .ok()
+                            .and_then(|p| native::relative(p).ok())
+                        {
+                            Some(path) => {
+                                error_paths.insert(path);
+                            }
+                            None => rescan = true,
+                        }
+                    }
+                    if error_paths.len() > CAPACITY {
+                        error_paths.clear();
+                        rescan = true;
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Err("watcher disconnected".into()),
@@ -138,11 +154,13 @@ pub fn run(
         }
         if credits > 0
             && (rescan
+                || !error_paths.is_empty()
                 || paths.len() >= 128
                 || last.elapsed() >= Duration::from_millis(debounce.max(10)))
         {
             let value = if rescan {
                 paths.clear();
+                error_paths.clear();
                 rescan = false;
                 Some(wire::message(
                     "rescan",
@@ -155,6 +173,31 @@ pub fn run(
                                 .unwrap_or_else(|| "events_may_be_lost".into())
                                 .into(),
                         ),
+                    ],
+                ))
+            } else if !error_paths.is_empty() {
+                let mut batch = vec![];
+                let mut size = 0;
+                while let Some(path) = error_paths.pop_first() {
+                    if size + path.len() > 256 * 1024 && !batch.is_empty() {
+                        error_paths.insert(path);
+                        break;
+                    }
+                    size += path.len();
+                    batch.push(Value::from(path));
+                    if batch.len() == 128 {
+                        break;
+                    }
+                }
+                Some(wire::message(
+                    "rescan",
+                    [
+                        ("batch_id", seq.into()),
+                        (
+                            "reason",
+                            error.clone().unwrap_or_else(|| "watch_error".into()).into(),
+                        ),
+                        ("paths", Value::List(batch)),
                     ],
                 ))
             } else if !paths.is_empty() {
@@ -187,6 +230,15 @@ pub fn run(
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn access_only(event: &Event) -> bool {
+    !event.need_rescan()
+        && matches!(
+            event.kind,
+            EventKind::Access(_)
+                | EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime))
+        )
 }
 
 fn absorb(root: &std::path::Path, event: Event, paths: &mut BTreeSet<Vec<u8>>, rescan: &mut bool) {
@@ -285,5 +337,16 @@ mod tests {
         }
         assert!(rescan);
         assert!(paths.len() <= CAPACITY);
+    }
+    #[test]
+    fn access_time_noise_is_filtered_before_buffering_but_rescan_is_kept() {
+        let event = Event::new(EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::AccessTime,
+        )));
+        assert!(access_only(&event));
+        assert!(!access_only(&event.set_flag(Flag::Rescan)));
+        assert!(!access_only(&Event::new(EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::WriteTime)
+        ))));
     }
 }

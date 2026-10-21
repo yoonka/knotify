@@ -6,7 +6,10 @@ mod watcher;
 use watcher::Watchman;
 mod catalog;
 mod hints;
+mod io_priority;
 mod native;
+mod policy;
+mod volume_identity;
 mod wire;
 
 #[derive(Parser)]

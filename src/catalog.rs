@@ -2,6 +2,7 @@
 //! content committer may advance dirs/files; observing disk never does so.
 use crate::{
     native::{self, Stamp},
+    policy::Policy,
     wire::{self, Value},
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -20,6 +21,7 @@ pub struct Catalog {
     pub database: PathBuf,
     pub root_id: String,
     identity: Stamp,
+    filesystem_identity: Option<Vec<u8>>,
     marker: Option<String>,
     excluded: Vec<PathBuf>,
     excluded_ids: Mutex<BTreeSet<(Vec<u8>, Vec<u8>)>>,
@@ -145,6 +147,21 @@ impl Catalog {
             transaction.commit()?;
             (id, marker)
         };
+        let filesystem_identity = crate::volume_identity::read(&root)?;
+        if let Some(expected) = conn
+            .query_row(
+                "SELECT value FROM root_info WHERE key='filesystem_identity'",
+                [],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+        {
+            if filesystem_identity.as_ref() != Some(&expected) {
+                return Err(
+                    "root_identity: filesystem UUID or dataset GUID changed or unavailable".into(),
+                );
+            }
+        }
         let mut excluded = excluded;
         if let Some(parent) = database.parent() {
             excluded.push(parent.to_path_buf());
@@ -185,12 +202,19 @@ impl Catalog {
             database: database.to_path_buf(),
             root_id,
             identity,
+            filesystem_identity,
             marker,
             excluded,
             excluded_ids: Mutex::new(excluded_ids),
             _lock: lock,
         };
         catalog.check_root()?;
+        if let Some(id) = &catalog.filesystem_identity {
+            conn.execute(
+                "INSERT OR IGNORE INTO root_info VALUES('filesystem_identity',?1)",
+                [id],
+            )?;
+        }
         catalog.refresh_exclusions()?;
         Ok(catalog)
     }
@@ -208,6 +232,16 @@ impl Catalog {
                 != *expected
         {
             return Err("root_identity: marker changed".into());
+        }
+        if let Some(expected) = &self.filesystem_identity
+            && crate::volume_identity::read(&self.root)
+                .map_err(|e| format!("root_identity: {e}"))?
+                .as_ref()
+                != Some(expected)
+        {
+            return Err(
+                "root_identity: filesystem UUID or dataset GUID changed or unavailable".into(),
+            );
         }
         Ok(())
     }
@@ -313,6 +347,45 @@ impl Catalog {
              ORDER BY name",
         )?)
     }
+    fn lookup_batch(conn: &Connection, paths: &[Value]) -> Result<BTreeMap<Vec<u8>, Stored>> {
+        conn.execute_batch("CREATE TEMP TABLE input_paths(path BLOB PRIMARY KEY,parent BLOB,name BLOB) WITHOUT ROWID")?;
+        {
+            let mut insert = conn.prepare("INSERT OR IGNORE INTO input_paths VALUES(?1,?2,?3)")?;
+            for value in paths {
+                let path = value.bytes()?;
+                for key in [path, split(path).0] {
+                    let (parent, name) = split(key);
+                    insert.execute(params![key, parent, name])?;
+                }
+            }
+        }
+        let mut query = conn.prepare(
+            "SELECT i.path,1,0,0,0,NULL,0 FROM input_paths i JOIN dirs d ON d.path=i.path
+             UNION ALL
+             SELECT i.path,0,f.size,f.mtime_ns,f.ctime_ns,f.ino,f.content_status
+             FROM input_paths i JOIN dirs d ON d.path=i.parent
+             JOIN files f ON f.dir_id=d.dir_id AND f.name=i.name",
+        )?;
+        Ok(query
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    Stored {
+                        kind: if row.get::<_, i64>(1)? == 1 {
+                            "dir"
+                        } else {
+                            "file"
+                        },
+                        size: row.get(2)?,
+                        mtime: row.get(3)?,
+                        ctime: row.get(4)?,
+                        ino: row.get(5)?,
+                        status: row.get(6)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
     fn compare(
         &self,
         path: &[u8],
@@ -352,6 +425,7 @@ impl Catalog {
         &self,
         conn: &Connection,
         path: &[u8],
+        policy: &Policy,
         emit: &mut impl FnMut(Value) -> Result<()>,
     ) -> Result<()> {
         let full = native::resolve(&self.root, path)?;
@@ -373,6 +447,9 @@ impl Catalog {
                 Self::lookup(conn, path)?.as_ref(),
                 emit,
             );
+        }
+        if !policy.traverse(path) {
+            return self.compare(path, None, Self::lookup(conn, path)?.as_ref(), emit);
         }
         // Finish enumeration before inferring absence. An entry stat failure is
         // unknown, not missing; a read_dir failure rejects the entire listing.
@@ -429,7 +506,7 @@ impl Catalog {
                 Ok(s) => {
                     self.compare(
                         &child,
-                        if self.ignored(&full, &s)? {
+                        if self.ignored(&full, &s)? || !policy.allows(&child) {
                             None
                         } else {
                             Some(&s)
@@ -437,6 +514,19 @@ impl Catalog {
                         stored.as_ref(),
                         emit,
                     )?;
+                    if s.kind == "dir"
+                        && !self.ignored(&full, &s)?
+                        && !policy.allows(&child)
+                        && policy.traverse(&child)
+                    {
+                        emit(directory(
+                            &child,
+                            stored.as_ref().is_none_or(|s| s.kind != "dir"),
+                        ))?;
+                    }
+                }
+                Err(e) if native::absent(&e) => {
+                    self.compare(&child, None, stored.as_ref(), emit)?
                 }
                 Err(e) => emit(unknown(&child, &e))?,
             }
@@ -451,34 +541,39 @@ impl Catalog {
         &self,
         conn: &Connection,
         paths: &[Value],
+        policy: &Policy,
         emit: &mut impl FnMut(Value) -> Result<()>,
     ) -> Result<()> {
         if paths.len() > 256 {
             return Err("too many paths".into());
         }
+        let stored = Self::lookup_batch(conn, paths)?;
         for path in paths {
             let path = path.bytes()?;
             let full = match native::resolve(&self.root, path) {
                 Ok(p) => p,
                 Err(e) if e.kind() == io::ErrorKind::Unsupported => {
                     let parent = split(path).0;
-                    emit(directory(parent, Self::lookup(conn, parent)?.is_none()))?;
+                    emit(directory(parent, !stored.contains_key(parent)))?;
                     continue;
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    emit(unknown(path, &e))?;
+                    continue;
+                }
             };
-            let old = Self::lookup(conn, path)?;
+            let old = stored.get(path);
             match native::stamp(&full) {
-                Ok(s) if self.ignored_tree(&full, &s)? => {
-                    self.compare(path, None, old.as_ref(), emit)?
+                Ok(s) if self.ignored_tree(&full, &s)? || !policy.allows(path) => {
+                    self.compare(path, None, old, emit)?
                 }
                 Ok(_s) if old.is_none() => {
                     // A listing supplies the authoritative spelling.
                     let parent = split(path).0;
-                    emit(directory(parent, Self::lookup(conn, parent)?.is_none()))?;
+                    emit(directory(parent, !stored.contains_key(parent)))?;
                 }
-                Ok(s) => self.compare(path, Some(&s), old.as_ref(), emit)?,
-                Err(e) if native::absent(&e) => self.compare(path, None, old.as_ref(), emit)?,
+                Ok(s) => self.compare(path, Some(&s), old, emit)?,
+                Err(e) if native::absent(&e) => self.compare(path, None, old, emit)?,
                 Err(e) => emit(unknown(path, &e))?,
             }
         }
@@ -489,6 +584,10 @@ impl Catalog {
         request: &Value,
         mut emit: impl FnMut(Value) -> Result<()>,
     ) -> Result<()> {
+        let _priority = crate::io_priority::Guard::enter(matches!(
+            request.get("background"),
+            Ok(Value::Bool(true))
+        ));
         self.check_root()?;
         // Windows resolves configured paths with the containing directory's
         // native case rules. Capture late-created directories before comparing
@@ -497,13 +596,20 @@ impl Catalog {
         self.refresh_exclusions()?;
         let conn = self.connection()?;
         conn.execute_batch("BEGIN")?;
+        let policy = Policy::parse(request.get("policy").ok())?;
         match request.get("op")?.bytes()? {
             b"check_root" => {}
             b"reconcile_dir" => {
-                self.reconcile_dir(&conn, request.get("path")?.bytes()?, &mut emit)?
+                let path = request.get("path")?.bytes()?;
+                if matches!(request.get("policy_change"), Ok(Value::Bool(true)))
+                    && !policy.allows(path)
+                {
+                    emit(change("delete_subtree", path, None))?;
+                }
+                self.reconcile_dir(&conn, path, &policy, &mut emit)?
             }
             b"reconcile_paths" => {
-                self.reconcile_paths(&conn, request.get("paths")?.list()?, &mut emit)?
+                self.reconcile_paths(&conn, request.get("paths")?.list()?, &policy, &mut emit)?
             }
             b"status" => {
                 let files: i64 = conn.query_row("SELECT count(*) FROM files", [], |r| r.get(0))?;
@@ -750,6 +856,111 @@ mod tests {
             params![name, id, s.size, s.mtime_ns, s.ctime_ns, s.id],
         )
         .unwrap();
+    }
+    #[test]
+    fn path_batch_join_handles_absent_ancestors_without_losing_other_paths() {
+        let (r, _d, c) = fixture();
+        fs::create_dir(r.path().join("former-dir")).unwrap();
+        let db = Connection::open(&c.database).unwrap();
+        db.execute(
+            "INSERT INTO dirs VALUES(2,1,?1,?1)",
+            [b"former-dir".as_slice()],
+        )
+        .unwrap();
+        let path = r.path().join("former-dir/gone");
+        fs::write(&path, b"old").unwrap();
+        let s = native::stamp(&path).unwrap();
+        db.execute(
+            "INSERT INTO files VALUES(2,?1,2,?2,?3,?4,?5,0)",
+            params![b"gone".as_slice(), s.size, s.mtime_ns, s.ctime_ns, s.id],
+        )
+        .unwrap();
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(r.path().join("former-dir")).unwrap();
+        fs::write(r.path().join("former-dir"), b"replacement").unwrap();
+        fs::write(r.path().join("stable"), b"original").unwrap();
+        seed(&c, b"stable", 3);
+        fs::write(r.path().join("stable"), b"changed size").unwrap();
+        let mut out = vec![];
+        c.request(
+            &Value::map([
+                ("op", "reconcile_paths".into()),
+                (
+                    "paths",
+                    Value::List(vec![
+                        b"former-dir/gone".to_vec().into(),
+                        b"stable".to_vec().into(),
+                        b"missing".to_vec().into(),
+                    ]),
+                ),
+            ]),
+            |v| {
+                out.push(v);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].get("op").unwrap().bytes().unwrap(), b"delete");
+        assert_eq!(out[1].get("op").unwrap().bytes().unwrap(), b"upsert");
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM files", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+    #[test]
+    fn soft_rules_keep_nested_inclusions_reachable_and_cannot_override_hard_exclusions() {
+        let (r, _d, c) = fixture();
+        for name in ["private/public", ".Trash-100", ".zfs"] {
+            fs::create_dir_all(r.path().join(name)).unwrap();
+        }
+        fs::write(r.path().join("private/secret"), b"x").unwrap();
+        fs::write(r.path().join("private/public/shared"), b"x").unwrap();
+        let policy = Value::map([
+            (
+                "rules",
+                Value::List(vec![
+                    Value::map([
+                        ("path", b"private".to_vec().into()),
+                        ("exclude", Value::Bool(true)),
+                    ]),
+                    Value::map([
+                        ("path", b"private/public".to_vec().into()),
+                        ("exclude", Value::Bool(false)),
+                    ]),
+                    Value::map([
+                        ("path", b".zfs".to_vec().into()),
+                        ("exclude", Value::Bool(false)),
+                    ]),
+                ]),
+            ),
+            (
+                "default_exclusions",
+                Value::List(vec![b".Trash-*".to_vec().into()]),
+            ),
+        ]);
+        for (path, expected) in [
+            (b"".as_slice(), b"private".as_slice()),
+            (b"private", b"private/public"),
+            (b"private/public", b"private/public/shared"),
+        ] {
+            let mut out = vec![];
+            c.request(
+                &Value::map([
+                    ("op", "reconcile_dir".into()),
+                    ("path", path.to_vec().into()),
+                    ("policy", policy.clone()),
+                ]),
+                |v| {
+                    out.push(v);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].get("path").unwrap().bytes().unwrap(), expected);
+        }
     }
     #[test]
     fn producer_does_not_advance_catalog_and_consumer_can_complete_work() {

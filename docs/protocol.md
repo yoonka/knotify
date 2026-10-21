@@ -49,14 +49,15 @@ Only one root is allowed in ETF hint mode. The service emits:
 | --- | --- |
 | `ready` | `service: "watcher"` |
 | `paths` | `batch_id`, `paths: [binary]` |
-| `rescan` | `batch_id`, `reason` |
+| `rescan` | `batch_id`, `reason`, optional `paths: [binary]` for scoped watch errors |
 | `error` | `code`, `message` |
 
 Send `{"version": 1, "type": "credit", "count": 4}` as ETF after subscribing.
 Each `paths` or `rescan` packet spends one credit. Return one credit only after
 accepting that batch into bounded intake. At most four may be outstanding.
-Registration errors precede termination. Errors and notify rescan flags require
-a whole-root rescan, regardless of any path attached to the original event.
+Registration errors precede termination. A watch error with known paths requests
+those subtrees. Unscoped errors, overflow and notify rescan flags require a
+whole-root rescan, regardless of any path attached to the flagged event.
 The callback has a 4,096-event nonblocking channel and the coalescer has a
 4,096-path limit. Either overflow retains a rescan requirement. Access-only
 events are omitted before the callback channel; a rescan flag survives this
@@ -81,6 +82,15 @@ Requests contain `version`, integer `id` and `op`:
 | `check_root` | none |
 | `status` | none |
 | `ack` / `cancel` | the active request ID |
+
+Reconciliation requests may include `policy: {rules: [{path: binary,
+exclude: boolean | nil}], default_exclusions: [binary]}`. The nearest explicit
+exclusion rule wins; nil inherits. Default name patterns support a trailing `*`.
+An inclusion beneath an exclusion remains reachable, but no soft rule can
+override hard exclusions. `policy_change: true` on `reconcile_dir` emits a
+`delete_subtree` hint for a newly excluded prefix, including an empty root path.
+`background: true` requests best-effort per-thread idle I/O on Linux or Windows
+background mode. The priority guard restores normal settings before event work.
 
 Responses are `batch` (`id`, `items`), `done` (`id`), or `error` (`id`, `code`,
 `message`). Batches contain at most 128 items and approximately 256 KiB. Each
@@ -119,6 +129,17 @@ it with an ordered SQLite cursor over catalog files and subdirectories. It
 retains only the current catalog child. Memory still scales with the complete
 disk listing of each active directory; bounded output is not a constant-memory
 directory walk. A failed listing produces no removals.
+Unix enumerates through `readdir` and `fstatat(dirfd, name, AT_SYMLINK_NOFOLLOW)`.
+Disappearing entries (ENOENT/ENOTDIR) count as absent; other stat failures remain
+unknown. Event batches use one temporary-table join, including their parents,
+instead of two catalog queries for each path. An ENOTDIR ancestor cannot abort
+unrelated paths in the batch. Temporary tables do not modify indexed rows.
+
+Enrollment also records a Linux filesystem UUID from `/dev/disk/by-uuid` or
+a Linux/FreeBSD ZFS dataset GUID when exposed to the ordinary user. An enrolled
+supplemental identity must continue to match; losing access to it fails closed.
+Unavailable identifiers fall back to native volume/directory identity and the
+root marker. FreeBSD/ZFS runtime validation is still required before rollout.
 
 Windows uses 64 KiB `FileIdExtdDirectoryInfo` batches on a single directory
 handle. This is the 128-bit file-ID variant of the design's bulk
