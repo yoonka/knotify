@@ -117,35 +117,43 @@ pub fn stamp(path: &Path) -> io::Result<Stamp> {
 }
 type Listing = BTreeMap<Vec<u8>, io::Result<Stamp>>;
 
-/// Resolve ancestor aliases before comparing roots; path spelling is not an
-/// identity boundary. Also compare native ancestor IDs for filesystem aliases.
-pub fn overlapping_roots(roots: &[PathBuf]) -> io::Result<bool> {
-    let mut identities = vec![];
-    for root in roots {
-        let canonical = match fs::canonicalize(root) {
-            Ok(path) => path,
-            Err(e) if absent(&e) => continue, // Offline roots are retried on refresh.
-            Err(e) => return Err(e),
-        };
-        let s = stamp(root)?;
-        if s.kind != "dir" {
-            return Err(io::Error::other("root is not a regular directory"));
-        }
-        let mut ancestors = vec![];
-        for path in canonical.ancestors() {
-            let s = stamp(path)?;
-            ancestors.push((s.volume, s.id));
-        }
-        identities.push(ancestors);
+#[derive(Default, Debug)]
+pub struct RootInspection {
+    pub overlaps: Vec<(usize, usize)>,
+    pub unavailable: Vec<(usize, String)>,
+}
+fn root_ancestors(root: &Path) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let canonical = fs::canonicalize(root)?;
+    if stamp(root)?.kind != "dir" {
+        return Err(io::Error::other("root is not a regular directory"));
     }
-    for (index, a) in identities.iter().enumerate() {
-        for b in &identities[index + 1..] {
+    canonical
+        .ancestors()
+        .map(|path| {
+            let s = stamp(path)?;
+            Ok((s.volume, s.id))
+        })
+        .collect()
+}
+/// Resolve ancestor aliases and compare native directory identities. A failure
+/// to inspect one root must not prevent unrelated roots from being inspected.
+pub fn inspect_roots(roots: &[PathBuf]) -> RootInspection {
+    let mut report = RootInspection::default();
+    let mut identities = vec![];
+    for (index, root) in roots.iter().enumerate() {
+        match root_ancestors(root) {
+            Ok(ancestors) => identities.push((index, ancestors)),
+            Err(e) => report.unavailable.push((index, e.to_string())),
+        }
+    }
+    for (position, (a_index, a)) in identities.iter().enumerate() {
+        for (b_index, b) in &identities[position + 1..] {
             if a.contains(&b[0]) || b.contains(&a[0]) {
-                return Ok(true);
+                report.overlaps.push((*a_index, *b_index));
             }
         }
     }
-    Ok(false)
+    report
 }
 
 #[cfg(test)]
@@ -159,9 +167,45 @@ mod root_tests {
         let nested = a.join("nested");
         fs::create_dir_all(&nested).unwrap();
         fs::create_dir(&b).unwrap();
-        assert!(overlapping_roots(&[a.clone(), nested]).unwrap());
-        assert!(overlapping_roots(&[a.clone(), a.clone()]).unwrap());
-        assert!(!overlapping_roots(&[a, b, d.path().join("offline")]).unwrap());
+        assert_eq!(inspect_roots(&[a.clone(), nested]).overlaps, vec![(0, 1)]);
+        assert_eq!(
+            inspect_roots(&[a.clone(), a.clone()]).overlaps,
+            vec![(0, 1)]
+        );
+        let report = inspect_roots(&[a, b, d.path().join("offline")]);
+        assert!(report.overlaps.is_empty());
+        assert_eq!(report.unavailable.len(), 1);
+        assert_eq!(report.unavailable[0].0, 2);
+    }
+    #[test]
+    fn one_bad_root_does_not_hide_other_roots_or_their_overlaps() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("root");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        let invalid = d.path().join("invalid");
+        fs::write(&invalid, b"not a directory").unwrap();
+        let report = inspect_roots(&[root.clone(), invalid, root.join("nested")]);
+        assert_eq!(report.overlaps, vec![(0, 2)]);
+        assert_eq!(report.unavailable.len(), 1);
+        assert_eq!(report.unavailable[0].0, 1);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn permission_denied_is_scoped_to_the_affected_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let healthy = d.path().join("healthy");
+        let blocked = d.path().join("blocked");
+        fs::create_dir(&healthy).unwrap();
+        fs::create_dir_all(blocked.join("nested")).unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0)).unwrap();
+        let report = inspect_roots(&[healthy, blocked.join("nested")]);
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(report.unavailable.len(), 1);
+            assert_eq!(report.unavailable[0].0, 1);
+        }
+        assert!(report.overlaps.is_empty());
     }
     #[cfg(unix)]
     #[test]
@@ -171,7 +215,10 @@ mod root_tests {
         fs::create_dir_all(root.join("nested")).unwrap();
         let alias = d.path().join("alias");
         std::os::unix::fs::symlink(&root, &alias).unwrap();
-        assert!(overlapping_roots(&[root, alias.join("nested")]).unwrap());
+        assert_eq!(
+            inspect_roots(&[root, alias.join("nested")]).overlaps,
+            vec![(0, 1)]
+        );
     }
     #[cfg(windows)]
     #[test]
@@ -191,7 +238,10 @@ mod root_tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(overlapping_roots(&[root, alias.join("nested")]).unwrap());
+        assert_eq!(
+            inspect_roots(&[root, alias.join("nested")]).overlaps,
+            vec![(0, 1)]
+        );
     }
 }
 

@@ -2,6 +2,11 @@ PRAGMA journal_mode = WAL;
 PRAGMA synchronous = FULL;
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS root_info (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS excluded_dirs (
+    volume BLOB NOT NULL,
+    ino BLOB NOT NULL,
+    PRIMARY KEY(volume, ino)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS dirs (
     dir_id INTEGER PRIMARY KEY,
     parent_id INTEGER REFERENCES dirs(dir_id),
@@ -21,4 +26,4 @@ CREATE TABLE IF NOT EXISTS files (
     PRIMARY KEY(dir_id, name)
 ) WITHOUT ROWID;
 INSERT OR IGNORE INTO dirs(dir_id, parent_id, name, path) VALUES(1, NULL, X'', X'');
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;

@@ -35,12 +35,40 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mode = args.next();
     if mode.as_deref() == Some(std::ffi::OsStr::new("check-roots")) {
         let args = RootsArgs::parse_from(std::iter::once(program).chain(args));
-        let message = match native::overlapping_roots(&args.root) {
-            Ok(overlap) => {
-                wire::message("roots_checked", [("overlap", wire::Value::Bool(overlap))])
-            }
-            Err(e) => wire::message("error", [("message", e.to_string().into())]),
-        };
+        let report = native::inspect_roots(&args.root);
+        let message = wire::message(
+            "roots_checked",
+            [
+                ("overlap", wire::Value::Bool(!report.overlaps.is_empty())),
+                (
+                    "overlaps",
+                    wire::Value::List(
+                        report
+                            .overlaps
+                            .into_iter()
+                            .map(|(a, b)| {
+                                wire::Value::List(vec![(a as i64).into(), (b as i64).into()])
+                            })
+                            .collect(),
+                    ),
+                ),
+                (
+                    "unavailable",
+                    wire::Value::List(
+                        report
+                            .unavailable
+                            .into_iter()
+                            .map(|(index, message)| {
+                                wire::Value::map([
+                                    ("index", (index as i64).into()),
+                                    ("message", message.into()),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+            ],
+        );
         wire::write(&mut std::io::stdout(), &message)?;
         Ok(())
     } else if mode.as_deref() == Some(std::ffi::OsStr::new("catalog")) {

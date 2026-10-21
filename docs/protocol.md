@@ -16,10 +16,14 @@ standalone legacy behavior is unchanged.
 
 `check-roots` is a short-lived enrollment preflight. It resolves ancestor
 aliases and compares native root/ancestor identities, returning one framed
-`roots_checked` packet with boolean `overlap`, or an `error` packet. It writes
-no markers or catalogs. Missing/offline roots are skipped and checked again
-when available; other inspection failures reject validation. Root configuration
-is revalidated before starting producer subtrees and at each manager refresh.
+`roots_checked` packet. It contains boolean `overlap`, `overlaps` (pairs of
+zero-based input indexes), and `unavailable` (maps with `index` and `message`).
+Missing, inaccessible and non-directory roots get root-local errors; other
+roots are still inspected for overlaps. It writes no markers or catalogs.
+Root configuration is revalidated before starting producer subtrees and at
+each manager refresh. Only affected roots are stopped or deferred. If the
+validator itself fails, unchanged active roots keep scanning under their own
+catalog identity checks; new enrollment waits for a successful preflight.
 
 ## Framing and paths
 
@@ -64,7 +68,7 @@ even when notify has not set its explicit rescan flag.
 ## Catalog
 
 The service enrolls root identity, obtains an exclusive adjacent `.lock` file,
-initializes schema version 1 and sends `ready` with `service: "catalog"` and
+initializes schema version 2 and sends `ready` with `service: "catalog"` and
 `root_id`. Writable roots receive `.aaryx-root`; read-only roots use native
 identity alone. Existing identity is never silently replaced.
 
@@ -98,6 +102,17 @@ IDs in root policy metadata. Renaming an excluded directory does not expose its
 contents, including through direct descendant path checks or after restart.
 Exclusions created after enrollment acquire their identity when first observed.
 These policy writes never advance indexed `dirs` or `files` rows.
+On Windows, configured exclusion directories are resolved again before each
+request using the filesystem's own case rules. A late-created directory can
+therefore be excluded even when its configured spelling has different casing,
+without changing opaque filenames or case-sensitive filesystem semantics.
+
+Schema 2 stores exclusion identities as individual `(volume, ino)` rows in
+`excluded_dirs`, rather than one ETF blob. Version-1 blobs are migrated in a
+transaction, including lists larger than the IPC decoder's item budget. The
+old key is removed only with the copied rows committed. Packet size, depth and
+item limits remain unchanged; a separate byte-bounded decoder is used only for
+this local legacy migration. Indexed directory/file rows remain untouched.
 
 Directory reconciliation completes and sorts one on-disk listing, then merges
 it with an ordered SQLite cursor over catalog files and subdirectories. It

@@ -6,7 +6,7 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -22,7 +22,7 @@ pub struct Catalog {
     identity: Stamp,
     marker: Option<String>,
     excluded: Vec<PathBuf>,
-    excluded_ids: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
+    excluded_ids: Mutex<BTreeSet<(Vec<u8>, Vec<u8>)>>,
     _lock: File,
 }
 #[derive(Debug)]
@@ -66,7 +66,7 @@ impl Catalog {
         let mut conn = Connection::open(database)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 1 {
+        if version > 2 {
             return Err("unsupported catalog schema version".into());
         }
         conn.execute_batch(include_str!("catalog.sql"))?;
@@ -153,7 +153,9 @@ impl Catalog {
             .into_iter()
             .map(|p| exclusion_path(&p))
             .collect::<io::Result<Vec<_>>>()?;
-        let mut excluded_ids = match conn
+        // Migrate even an oversized legacy list without relaxing IPC limits.
+        // Copy and remove the old key atomically; an interrupted upgrade retries.
+        if let Some(bytes) = conn
             .query_row(
                 "SELECT value FROM root_info WHERE key='excluded_identities'",
                 [],
@@ -161,31 +163,23 @@ impl Catalog {
             )
             .optional()?
         {
-            Some(bytes) => wire::decode(&bytes)?
-                .list()?
-                .iter()
-                .map(|v| {
-                    Ok((
-                        v.get("volume")?.bytes()?.to_vec(),
-                        v.get("ino")?.bytes()?.to_vec(),
-                    ))
-                })
-                .collect::<io::Result<Vec<_>>>()?,
-            None => vec![],
-        };
-        for path in &excluded {
-            match native::stamp(path) {
-                Ok(s) if s.kind == "dir" => {
-                    let id = (s.volume, s.id);
-                    if !excluded_ids.contains(&id) {
-                        excluded_ids.push(id);
-                    }
-                }
-                Ok(_) => {}
-                Err(e) if native::absent(&e) => {}
-                Err(e) => return Err(e.into()),
+            let legacy = wire::decode_legacy_exclusions(&bytes)?;
+            let transaction = conn.transaction()?;
+            for value in legacy.list()? {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO excluded_dirs VALUES(?1,?2)",
+                    params![value.get("volume")?.bytes()?, value.get("ino")?.bytes()?],
+                )?;
             }
+            transaction.execute("DELETE FROM root_info WHERE key='excluded_identities'", [])?;
+            transaction.commit()?;
         }
+        let excluded_ids = conn
+            .prepare("SELECT volume,ino FROM excluded_dirs")?
+            .query_map([], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
         let catalog = Self {
             root,
             database: database.to_path_buf(),
@@ -197,7 +191,7 @@ impl Catalog {
             _lock: lock,
         };
         catalog.check_root()?;
-        catalog.save_exclusions(&catalog.excluded_ids.lock().unwrap())?;
+        catalog.refresh_exclusions()?;
         Ok(catalog)
     }
     pub fn check_root(&self) -> Result<()> {
@@ -225,23 +219,29 @@ impl Catalog {
         c.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(c)
     }
-    fn save_exclusions(&self, ids: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
-        let values = Value::List(
-            ids.iter()
-                .map(|(volume, ino)| {
-                    Value::map([
-                        ("volume", volume.clone().into()),
-                        ("ino", ino.clone().into()),
-                    ])
-                })
-                .collect(),
-        );
-        let conn = Connection::open(&self.database)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.execute(
-            "INSERT OR REPLACE INTO root_info VALUES('excluded_identities',?1)",
-            [wire::encode(&values)?],
-        )?;
+    fn remember_exclusion(&self, stat: &Stamp) -> Result<()> {
+        let mut ids = self.excluded_ids.lock().unwrap();
+        let id = (stat.volume.clone(), stat.id.clone());
+        if !ids.contains(&id) {
+            let conn = Connection::open(&self.database)?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+            conn.execute(
+                "INSERT OR IGNORE INTO excluded_dirs VALUES(?1,?2)",
+                params![id.0, id.1],
+            )?;
+            ids.insert(id);
+        }
+        Ok(())
+    }
+    fn refresh_exclusions(&self) -> Result<()> {
+        for path in &self.excluded {
+            match native::stamp(path) {
+                Ok(stat) if stat.kind == "dir" => self.remember_exclusion(&stat)?,
+                Ok(_) => {}
+                Err(e) if native::absent(&e) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         Ok(())
     }
     fn ignored(&self, path: &Path, stat: &Stamp) -> Result<bool> {
@@ -257,16 +257,12 @@ impl Catalog {
                     })
                 })
                 .unwrap_or(true);
-        let mut ids = self.excluded_ids.lock().unwrap();
-        let id = (stat.volume.clone(), stat.id.clone());
-        if by_path && stat.kind == "dir" && !ids.contains(&id) {
-            ids.push(id.clone());
-            // Root enrollment/policy metadata only; indexed rows remain untouched.
-            if let Err(error) = self.save_exclusions(&ids) {
-                ids.pop();
-                return Err(error);
-            }
+        if by_path && stat.kind == "dir" {
+            // Root policy metadata only; indexed rows remain untouched.
+            self.remember_exclusion(stat)?;
         }
+        let ids = self.excluded_ids.lock().unwrap();
+        let id = (stat.volume.clone(), stat.id.clone());
         Ok(stat.kind == "other"
             || stat.volume != self.identity.volume
             || by_path
@@ -494,6 +490,11 @@ impl Catalog {
         mut emit: impl FnMut(Value) -> Result<()>,
     ) -> Result<()> {
         self.check_root()?;
+        // Windows resolves configured paths with the containing directory's
+        // native case rules. Capture late-created directories before comparing
+        // the listing; never case-fold stored names or catalog keys.
+        #[cfg(windows)]
+        self.refresh_exclusions()?;
         let conn = self.connection()?;
         conn.execute_batch("BEGIN")?;
         match request.get("op")?.bytes()? {
@@ -936,6 +937,139 @@ mod tests {
         assert!(scan(&c).is_empty());
         fs::rename(&path, r.path().join("renamed-state")).unwrap();
         assert!(scan(&c).is_empty());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn late_created_exclusions_use_native_case_resolution_and_keep_identity() {
+        let r = tempfile::tempdir().unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let policy = r.path().join("FUTURE-STATE");
+        let database = d.path().join("catalog.sqlite3");
+        let c = Catalog::open(r.path(), &database, vec![policy.clone()]).unwrap();
+        let actual = r.path().join("future-state");
+        fs::create_dir(&actual).unwrap();
+        fs::write(actual.join("internal"), b"state").unwrap();
+        assert!(
+            policy.is_dir(),
+            "fixture requires a case-insensitive directory"
+        );
+        // Direct event checks must work even before a full scan observes it.
+        c.request(
+            &Value::map([
+                ("op", "reconcile_paths".into()),
+                (
+                    "paths",
+                    Value::List(vec![b"future-state/internal".to_vec().into()]),
+                ),
+            ]),
+            |_| panic!("excluded event leaked"),
+        )
+        .unwrap();
+        assert!(scan(&c).is_empty());
+        fs::rename(actual, r.path().join("renamed-state")).unwrap();
+        drop(c);
+        let c = Catalog::open(r.path(), &database, vec![policy]).unwrap();
+        assert!(scan(&c).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusions_do_not_fold_case_on_case_sensitive_filesystems() {
+        let r = tempfile::tempdir().unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let policy = r.path().join("STATE");
+        let c = Catalog::open(
+            r.path(),
+            &d.path().join("catalog.sqlite3"),
+            vec![policy.clone()],
+        )
+        .unwrap();
+        fs::create_dir(policy).unwrap();
+        fs::create_dir(r.path().join("state")).unwrap();
+        let out = scan(&c);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].get("path").unwrap().bytes().unwrap(), b"state");
+    }
+
+    #[test]
+    fn large_exclusion_sets_survive_scan_and_restart() {
+        let (r, d, c) = fixture();
+        for n in 0..1700 {
+            fs::create_dir(r.path().join(format!(".aaryx-state-{n}"))).unwrap();
+        }
+        assert!(scan(&c).is_empty());
+        drop(c);
+        let c = Catalog::open(r.path(), &d.path().join("catalog.sqlite3"), vec![]).unwrap();
+        assert!(scan(&c).is_empty());
+        let count: i64 = Connection::open(&c.database)
+            .unwrap()
+            .query_row("SELECT count(*) FROM excluded_dirs", [], |r| r.get(0))
+            .unwrap();
+        assert!(count >= 1700);
+    }
+
+    #[test]
+    fn oversized_legacy_exclusions_migrate_without_changing_indexed_rows() {
+        let (r, d, c) = fixture();
+        fs::write(r.path().join("indexed"), b"content").unwrap();
+        seed(&c, b"indexed", 1);
+        fs::create_dir(r.path().join("managed")).unwrap();
+        let stat = native::stamp(&r.path().join("managed")).unwrap();
+        let mut values = vec![Value::map([
+            ("volume", stat.volume.into()),
+            ("ino", stat.id.into()),
+        ])];
+        for n in 1..1700u64 {
+            values.push(Value::map([
+                ("volume", b"legacy-volume".to_vec().into()),
+                ("ino", n.to_be_bytes().to_vec().into()),
+            ]));
+        }
+        let legacy = wire::encode(&Value::List(values)).unwrap();
+        assert!(wire::decode(&legacy).is_err());
+        let db = Connection::open(&c.database).unwrap();
+        db.execute(
+            "INSERT INTO root_info VALUES('excluded_identities',?1)",
+            [legacy],
+        )
+        .unwrap();
+        db.execute_batch("DELETE FROM excluded_dirs; PRAGMA user_version=1")
+            .unwrap();
+        drop(c);
+        fs::rename(r.path().join("managed"), r.path().join("renamed")).unwrap();
+        let c = Catalog::open(r.path(), &d.path().join("catalog.sqlite3"), vec![]).unwrap();
+        assert!(scan(&c).is_empty());
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM files", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(
+            db.query_row("SELECT count(*) FROM excluded_dirs", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap()
+                >= 1700
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM root_info WHERE key='excluded_identities'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        drop(c);
+        // The migration is idempotent on the next open too.
+        assert!(
+            scan(&Catalog::open(r.path(), &d.path().join("catalog.sqlite3"), vec![]).unwrap())
+                .is_empty()
+        );
     }
     #[test]
     fn indexed_rows_without_enrollment_are_never_adopted() {
