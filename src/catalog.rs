@@ -33,6 +33,17 @@ struct Stored {
     ino: Option<Vec<u8>>,
     status: i64,
 }
+impl Stored {
+    fn matches(&self, stamp: &Stamp) -> bool {
+        self.kind == "file"
+            && stamp.kind == "file"
+            && self.size == stamp.size
+            && self.mtime == stamp.mtime_ns
+            && self.ctime == stamp.ctime_ns
+            && self.ino.as_ref().is_none_or(|ino| ino == &stamp.id)
+            && self.status <= 1
+    }
+}
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 impl Catalog {
     pub fn open(root: &Path, database: &Path, excluded: Vec<PathBuf>) -> Result<Self> {
@@ -252,14 +263,7 @@ impl Catalog {
                 emit(directory(path, old.is_none_or(|entry| entry.kind != "dir")))
             }
             Some(s) if s.kind == "file" => {
-                let same = old.is_some_and(|o| {
-                    o.kind == "file"
-                        && o.size == s.size
-                        && o.mtime == s.mtime_ns
-                        && o.ctime == s.ctime_ns
-                        && o.ino.as_ref().is_none_or(|ino| ino == &s.id)
-                        && o.status <= 1
-                });
+                let same = old.is_some_and(|o| o.matches(s));
                 if !same {
                     emit(change("upsert", path, Some(s)))?;
                 }
@@ -331,9 +335,22 @@ impl Catalog {
                 None
             };
             let child = native::join(path, &name);
+            let full = full.join(native::decode(&name)?);
+            #[cfg(windows)]
+            let stat = match stat {
+                // NTFS directory entries can retain stale metadata for a hard
+                // link edited through another name. Bulk metadata may queue
+                // a hint, but must not alone justify skipping indexed work.
+                Ok(s)
+                    if stored.as_ref().is_some_and(|old| old.matches(&s))
+                        && !self.ignored(&full, &s) =>
+                {
+                    native::stamp(&full)
+                }
+                other => other,
+            };
             match stat {
                 Ok(s) => {
-                    let full = full.join(native::decode(&name)?);
                     self.compare(
                         &child,
                         if self.ignored(&full, &s) {
@@ -817,6 +834,23 @@ mod tests {
         let changes = scan(&c);
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].get("path").unwrap().bytes().unwrap(), b"a");
+    }
+
+    #[test]
+    fn same_size_edits_through_one_hard_link_requeue_both_paths() {
+        let (r, _d, c) = fixture();
+        fs::write(r.path().join("first"), b"before").unwrap();
+        fs::hard_link(r.path().join("first"), r.path().join("second")).unwrap();
+        seed(&c, b"first", 1);
+        seed(&c, b"second", 2);
+        assert!(scan(&c).is_empty());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(r.path().join("first"), b"after!").unwrap();
+        let changes = scan(&c);
+        assert_eq!(changes.len(), 2);
+        for change in changes {
+            assert_eq!(change.get("op").unwrap().bytes().unwrap(), b"upsert");
+        }
     }
     #[test]
     fn missing_directories_and_directory_to_file_replacements_are_explicit() {

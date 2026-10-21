@@ -97,6 +97,12 @@ handle. This is the 128-bit file-ID variant of the design's bulk
 existing `FileIdInfo` identity keys while returning size, modification time,
 and ChangeTime without opening each child. Unsupported or incomplete bulk
 enumeration fails reconciliation rather than silently inferring removals.
+NTFS can cache old directory-entry timestamps for a hard link changed through
+another name. Consequently, an apparently unchanged indexed file receives a
+fresh handle-based metadata check before it can be skipped. New, changed or
+stale entries already require a downstream hint and need no such extra read.
+Bulk enumeration reduces work, but eliminating all per-file checks would
+weaken hard-link correctness; the same-size hard-link edit regression covers it.
 
 The catalog contains `root_info`, `dirs` and `files`; `files` is keyed by binary
 directory/name and has a unique root-local integer `file_id`, size/timestamps,
