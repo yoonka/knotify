@@ -548,13 +548,27 @@ impl Catalog {
             return Err("too many paths".into());
         }
         let stored = Self::lookup_batch(conn, paths)?;
+        // An event's parent components are hints too. A parent absent from the
+        // catalog may have different on-disk casing/normalization. Rediscover
+        // from the known root rather than manufacturing keys with that prefix.
+        let parent = |path: &[u8]| -> Vec<u8> {
+            let parent = split(path).0;
+            if stored.get(parent).is_some_and(|s| s.kind == "dir") {
+                parent.to_vec()
+            } else {
+                vec![]
+            }
+        };
+        let mut scheduled = BTreeSet::new();
         for path in paths {
             let path = path.bytes()?;
             let full = match native::resolve(&self.root, path) {
                 Ok(p) => p,
                 Err(e) if e.kind() == io::ErrorKind::Unsupported => {
-                    let parent = split(path).0;
-                    emit(directory(parent, !stored.contains_key(parent)))?;
+                    let parent = parent(path);
+                    if scheduled.insert(parent.clone()) {
+                        emit(directory(&parent, false))?;
+                    }
                     continue;
                 }
                 Err(e) => {
@@ -569,8 +583,10 @@ impl Catalog {
                 }
                 Ok(_s) if old.is_none() => {
                     // A listing supplies the authoritative spelling.
-                    let parent = split(path).0;
-                    emit(directory(parent, !stored.contains_key(parent)))?;
+                    let parent = parent(path);
+                    if scheduled.insert(parent.clone()) {
+                        emit(directory(&parent, false))?;
+                    }
                 }
                 Ok(s) => self.compare(path, Some(&s), old, emit)?,
                 Err(e) if native::absent(&e) => self.compare(path, None, old, emit)?,
@@ -856,6 +872,110 @@ mod tests {
             params![name, id, s.size, s.mtime_ns, s.ctime_ns, s.id],
         )
         .unwrap();
+    }
+    #[test]
+    fn unknown_event_parents_are_rediscovered_from_known_names_once_per_batch() {
+        let (r, _d, c) = fixture();
+        fs::create_dir_all(r.path().join("Unlisted/Nested")).unwrap();
+        for name in ["a", "b"] {
+            fs::write(r.path().join("Unlisted/Nested").join(name), b"new").unwrap();
+        }
+        let mut out = vec![];
+        c.request(
+            &Value::map([
+                ("op", "reconcile_paths".into()),
+                (
+                    "paths",
+                    Value::List(vec![
+                        b"Unlisted/Nested/a".to_vec().into(),
+                        b"Unlisted/Nested/b".to_vec().into(),
+                    ]),
+                ),
+            ]),
+            |v| {
+                out.push(v);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(out, vec![directory(b"", false)]);
+        let db = Connection::open(&c.database).unwrap();
+        db.execute(
+            "INSERT INTO dirs VALUES(2,1,?1,?1)",
+            [b"Unlisted".as_slice()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO dirs VALUES(3,2,?1,?2)",
+            params![b"Nested".as_slice(), b"Unlisted/Nested".as_slice()],
+        )
+        .unwrap();
+        out.clear();
+        c.request(
+            &Value::map([
+                ("op", "reconcile_paths".into()),
+                (
+                    "paths",
+                    Value::List(vec![
+                        b"Unlisted/Nested/a".to_vec().into(),
+                        b"Unlisted/Nested/b".to_vec().into(),
+                    ]),
+                ),
+            ]),
+            |v| {
+                out.push(v);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(out, vec![directory(b"Unlisted/Nested", false)]);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn differently_cased_nested_events_cannot_manufacture_path_prefixes() {
+        let (r, _d, c) = fixture();
+        fs::create_dir_all(r.path().join("MixedCase/Nested")).unwrap();
+        fs::write(r.path().join("MixedCase/Nested/Exact.TXT"), b"content").unwrap();
+        // NTFS's normal case-insensitive lookup accepts this spelling, but
+        // its listing is still the only authority for new catalog keys.
+        assert!(r.path().join("mixedcase/nested/exact.txt").is_file());
+        let mut out = vec![];
+        c.request(
+            &Value::map([
+                ("op", "reconcile_paths".into()),
+                (
+                    "paths",
+                    Value::List(vec![b"mixedcase/nested/exact.txt".to_vec().into()]),
+                ),
+            ]),
+            |v| {
+                out.push(v);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(out, vec![directory(b"", false)]);
+        let mut pending = vec![vec![]];
+        let mut changes = vec![];
+        while let Some(path) = pending.pop() {
+            c.request(
+                &Value::map([("op", "reconcile_dir".into()), ("path", path.into())]),
+                |v| {
+                    if v.get("type")?.bytes()? == b"directory" {
+                        pending.push(v.get("path")?.bytes()?.to_vec());
+                    } else {
+                        changes.push(v);
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes[0].get("path").unwrap().bytes().unwrap(),
+            b"MixedCase/Nested/Exact.TXT"
+        );
     }
     #[test]
     fn path_batch_join_handles_absent_ancestors_without_losing_other_paths() {

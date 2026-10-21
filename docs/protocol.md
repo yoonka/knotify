@@ -124,6 +124,14 @@ old key is removed only with the copied rows committed. Packet size, depth and
 item limits remain unchanged; a separate byte-bounded decoder is used only for
 this local legacy migration. Indexed directory/file rows remain untouched.
 
+Event parent components are untrusted spellings too. `reconcile_paths` schedules
+the immediate parent only when its exact binary key is a known catalog directory;
+otherwise it schedules the enrolled root. That listing rediscovers the actual
+parent names before child keys are constructed. No case folding, Unicode
+normalization or guessed parent prefix is persisted. Duplicate parent requests
+coalesce within the native batch. Scoped watcher errors use this path-check
+boundary before scheduling directory work as well.
+
 Directory reconciliation completes and sorts one on-disk listing, then merges
 it with an ordered SQLite cursor over catalog files and subdirectories. It
 retains only the current catalog child. Memory still scales with the complete
