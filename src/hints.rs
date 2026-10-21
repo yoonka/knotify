@@ -37,6 +37,12 @@ pub fn run(
     let lost = Arc::clone(&overflow);
     let mut watcher = notify::RecommendedWatcher::new(
         move |event: notify::Result<Event>| {
+            if event
+                .as_ref()
+                .is_ok_and(|e| matches!(e.kind, EventKind::Access(_)) && !e.need_rescan())
+            {
+                return;
+            }
             if tx.try_send(event).is_err() {
                 lost.store(true, Ordering::Release);
             }

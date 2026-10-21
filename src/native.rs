@@ -117,6 +117,84 @@ pub fn stamp(path: &Path) -> io::Result<Stamp> {
 }
 type Listing = BTreeMap<Vec<u8>, io::Result<Stamp>>;
 
+/// Resolve ancestor aliases before comparing roots; path spelling is not an
+/// identity boundary. Also compare native ancestor IDs for filesystem aliases.
+pub fn overlapping_roots(roots: &[PathBuf]) -> io::Result<bool> {
+    let mut identities = vec![];
+    for root in roots {
+        let canonical = match fs::canonicalize(root) {
+            Ok(path) => path,
+            Err(e) if absent(&e) => continue, // Offline roots are retried on refresh.
+            Err(e) => return Err(e),
+        };
+        let s = stamp(root)?;
+        if s.kind != "dir" {
+            return Err(io::Error::other("root is not a regular directory"));
+        }
+        let mut ancestors = vec![];
+        for path in canonical.ancestors() {
+            let s = stamp(path)?;
+            ancestors.push((s.volume, s.id));
+        }
+        identities.push(ancestors);
+    }
+    for (index, a) in identities.iter().enumerate() {
+        for b in &identities[index + 1..] {
+            if a.contains(&b[0]) || b.contains(&a[0]) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod root_tests {
+    use super::*;
+    #[test]
+    fn rejects_nested_and_duplicate_roots_but_allows_siblings_and_offline_roots() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a");
+        let b = d.path().join("b");
+        let nested = a.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir(&b).unwrap();
+        assert!(overlapping_roots(&[a.clone(), nested]).unwrap());
+        assert!(overlapping_roots(&[a.clone(), a.clone()]).unwrap());
+        assert!(!overlapping_roots(&[a, b, d.path().join("offline")]).unwrap());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn rejects_nested_roots_hidden_by_ancestor_symlinks() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("root");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        let alias = d.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        assert!(overlapping_roots(&[root, alias.join("nested")]).unwrap());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn rejects_nested_roots_hidden_by_ancestor_junctions() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("root");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        let alias = d.path().join("alias");
+        let output = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&alias)
+            .arg(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(overlapping_roots(&[root, alias.join("nested")]).unwrap());
+    }
+}
+
 #[cfg(unix)]
 pub fn listing(path: &Path) -> io::Result<Listing> {
     let mut listing = BTreeMap::new();

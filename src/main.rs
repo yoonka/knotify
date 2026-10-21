@@ -18,6 +18,11 @@ struct CatalogArgs {
     #[arg(long)]
     exclude: Vec<std::path::PathBuf>,
 }
+#[derive(Parser)]
+struct RootsArgs {
+    #[arg(long, required = true)]
+    root: Vec<std::path::PathBuf>,
+}
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error}");
@@ -27,7 +32,18 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut args = std::env::args_os();
     let program = args.next().unwrap();
-    if args.next().as_deref() == Some(std::ffi::OsStr::new("catalog")) {
+    let mode = args.next();
+    if mode.as_deref() == Some(std::ffi::OsStr::new("check-roots")) {
+        let args = RootsArgs::parse_from(std::iter::once(program).chain(args));
+        let message = match native::overlapping_roots(&args.root) {
+            Ok(overlap) => {
+                wire::message("roots_checked", [("overlap", wire::Value::Bool(overlap))])
+            }
+            Err(e) => wire::message("error", [("message", e.to_string().into())]),
+        };
+        wire::write(&mut std::io::stdout(), &message)?;
+        Ok(())
+    } else if mode.as_deref() == Some(std::ffi::OsStr::new("catalog")) {
         let args = CatalogArgs::parse_from(std::iter::once(program).chain(args));
         match catalog::Catalog::open(&args.root, &args.database, args.exclude) {
             Ok(c) => catalog::run(c),

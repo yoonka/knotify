@@ -6,12 +6,20 @@ Version 1.1 adds two opt-in modes in the same executable:
 ```text
 knotify --protocol etf --path ROOT --recursive
 knotify catalog --root ROOT --database STATE/catalog.sqlite3 --exclude STATE
+knotify check-roots --root ROOT --root OTHER_ROOT
 ```
 
 Run these as separate processes. Diagnostics go to stderr. Closing stdin exits
 either service, including a catalog worker waiting for acknowledgement. Legacy
 JSON wrappers can set `KNOTIFY_EXIT_ON_EOF=1` to request the same lifecycle;
 standalone legacy behavior is unchanged.
+
+`check-roots` is a short-lived enrollment preflight. It resolves ancestor
+aliases and compares native root/ancestor identities, returning one framed
+`roots_checked` packet with boolean `overlap`, or an `error` packet. It writes
+no markers or catalogs. Missing/offline roots are skipped and checked again
+when available; other inspection failures reject validation. Root configuration
+is revalidated before starting producer subtrees and at each manager refresh.
 
 ## Framing and paths
 
@@ -47,7 +55,8 @@ Registration errors precede termination. Errors and notify rescan flags require
 a whole-root rescan, regardless of any path attached to the original event.
 The callback has a 4,096-event nonblocking channel and the coalescer has a
 4,096-path limit. Either overflow retains a rescan requirement. Access-only
-events are omitted; a rescan flag is processed before filtering. Renames and
+events are omitted before the callback channel; a rescan flag survives this
+filtering. Renames and
 delete/create pairs are path hints, never inferred final actions.
 An `Any` or `Other` event without paths also requires a whole-root rescan,
 even when notify has not set its explicit rescan flag.
@@ -84,6 +93,11 @@ Observed metadata is advisory. Unknown entries and failed enumeration never
 prove absence. Native root identity is checked before and after reconciliation
 and before emitting batches. Own state, `.aaryx-*`, `.zfs`, links/reparse points
 and other filesystem volumes are excluded.
+Configured/internal directory exclusions also retain their native volume/file
+IDs in root policy metadata. Renaming an excluded directory does not expose its
+contents, including through direct descendant path checks or after restart.
+Exclusions created after enrollment acquire their identity when first observed.
+These policy writes never advance indexed `dirs` or `files` rows.
 
 Directory reconciliation completes and sorts one on-disk listing, then merges
 it with an ordered SQLite cursor over catalog files and subdirectories. It

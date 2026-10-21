@@ -22,6 +22,7 @@ pub struct Catalog {
     identity: Stamp,
     marker: Option<String>,
     excluded: Vec<PathBuf>,
+    excluded_ids: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
     _lock: File,
 }
 #[derive(Debug)]
@@ -152,6 +153,39 @@ impl Catalog {
             .into_iter()
             .map(|p| exclusion_path(&p))
             .collect::<io::Result<Vec<_>>>()?;
+        let mut excluded_ids = match conn
+            .query_row(
+                "SELECT value FROM root_info WHERE key='excluded_identities'",
+                [],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+        {
+            Some(bytes) => wire::decode(&bytes)?
+                .list()?
+                .iter()
+                .map(|v| {
+                    Ok((
+                        v.get("volume")?.bytes()?.to_vec(),
+                        v.get("ino")?.bytes()?.to_vec(),
+                    ))
+                })
+                .collect::<io::Result<Vec<_>>>()?,
+            None => vec![],
+        };
+        for path in &excluded {
+            match native::stamp(path) {
+                Ok(s) if s.kind == "dir" => {
+                    let id = (s.volume, s.id);
+                    if !excluded_ids.contains(&id) {
+                        excluded_ids.push(id);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) if native::absent(&e) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         let catalog = Self {
             root,
             database: database.to_path_buf(),
@@ -159,9 +193,11 @@ impl Catalog {
             identity,
             marker,
             excluded,
+            excluded_ids: Mutex::new(excluded_ids),
             _lock: lock,
         };
         catalog.check_root()?;
+        catalog.save_exclusions(&catalog.excluded_ids.lock().unwrap())?;
         Ok(catalog)
     }
     pub fn check_root(&self) -> Result<()> {
@@ -189,10 +225,27 @@ impl Catalog {
         c.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(c)
     }
-    fn ignored(&self, path: &Path, stat: &Stamp) -> bool {
-        stat.kind == "other"
-            || stat.volume != self.identity.volume
-            || self.excluded.iter().any(|p| path.starts_with(p))
+    fn save_exclusions(&self, ids: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        let values = Value::List(
+            ids.iter()
+                .map(|(volume, ino)| {
+                    Value::map([
+                        ("volume", volume.clone().into()),
+                        ("ino", ino.clone().into()),
+                    ])
+                })
+                .collect(),
+        );
+        let conn = Connection::open(&self.database)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO root_info VALUES('excluded_identities',?1)",
+            [wire::encode(&values)?],
+        )?;
+        Ok(())
+    }
+    fn ignored(&self, path: &Path, stat: &Stamp) -> Result<bool> {
+        let by_path = self.excluded.iter().any(|p| path.starts_with(p))
             || path
                 .strip_prefix(&self.root)
                 .map(|r| {
@@ -203,7 +256,34 @@ impl Catalog {
                         name.starts_with(b".aaryx-") || name == b".zfs"
                     })
                 })
-                .unwrap_or(true)
+                .unwrap_or(true);
+        let mut ids = self.excluded_ids.lock().unwrap();
+        let id = (stat.volume.clone(), stat.id.clone());
+        if by_path && stat.kind == "dir" && !ids.contains(&id) {
+            ids.push(id.clone());
+            // Root enrollment/policy metadata only; indexed rows remain untouched.
+            if let Err(error) = self.save_exclusions(&ids) {
+                ids.pop();
+                return Err(error);
+            }
+        }
+        Ok(stat.kind == "other"
+            || stat.volume != self.identity.volume
+            || by_path
+            || (stat.kind == "dir" && ids.contains(&id)))
+    }
+    fn ignored_tree(&self, path: &Path, stat: &Stamp) -> Result<bool> {
+        if self.ignored(path, stat)? {
+            return Ok(true);
+        }
+        let mut parent = path.parent();
+        while let Some(p) = parent.filter(|p| p.starts_with(&self.root) && *p != self.root) {
+            if self.ignored(p, &native::stamp(p)?)? {
+                return Ok(true);
+            }
+            parent = p.parent();
+        }
+        Ok(false)
     }
     fn lookup(conn: &Connection, path: &[u8]) -> Result<Option<Stored>> {
         if let Some(v) = conn
@@ -286,10 +366,10 @@ impl Catalog {
             }
             Err(e) => return Err(e.into()),
         };
-        if actual.kind != "dir" || self.ignored(&full, &actual) {
+        if actual.kind != "dir" || self.ignored_tree(&full, &actual)? {
             return self.compare(
                 path,
-                if self.ignored(&full, &actual) {
+                if self.ignored_tree(&full, &actual)? {
                     None
                 } else {
                     Some(&actual)
@@ -343,7 +423,7 @@ impl Catalog {
                 // a hint, but must not alone justify skipping indexed work.
                 Ok(s)
                     if stored.as_ref().is_some_and(|old| old.matches(&s))
-                        && !self.ignored(&full, &s) =>
+                        && !self.ignored(&full, &s)? =>
                 {
                     native::stamp(&full)
                 }
@@ -353,7 +433,7 @@ impl Catalog {
                 Ok(s) => {
                     self.compare(
                         &child,
-                        if self.ignored(&full, &s) {
+                        if self.ignored(&full, &s)? {
                             None
                         } else {
                             Some(&s)
@@ -393,7 +473,9 @@ impl Catalog {
             };
             let old = Self::lookup(conn, path)?;
             match native::stamp(&full) {
-                Ok(s) if self.ignored(&full, &s) => self.compare(path, None, old.as_ref(), emit)?,
+                Ok(s) if self.ignored_tree(&full, &s)? => {
+                    self.compare(path, None, old.as_ref(), emit)?
+                }
                 Ok(_s) if old.is_none() => {
                     // A listing supplies the authoritative spelling.
                     let parent = split(path).0;
@@ -802,6 +884,58 @@ mod tests {
         )
         .unwrap();
         assert!(out.is_empty());
+    }
+    #[test]
+    fn renamed_exclusions_and_their_descendants_stay_excluded_after_restart() {
+        let r = tempfile::tempdir().unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let path = r.path().join("managed");
+        fs::create_dir_all(path.join("nested")).unwrap();
+        fs::write(path.join("nested/internal"), b"state").unwrap();
+        let db = d.path().join("catalog.sqlite3");
+        let c = Catalog::open(r.path(), &db, vec![path.clone()]).unwrap();
+        assert!(scan(&c).is_empty());
+        fs::rename(&path, r.path().join("renamed")).unwrap();
+        assert!(scan(&c).is_empty());
+        for op in ["reconcile_dir", "reconcile_paths"] {
+            let request = if op == "reconcile_dir" {
+                Value::map([
+                    ("op", op.into()),
+                    ("path", b"renamed/nested".to_vec().into()),
+                ])
+            } else {
+                Value::map([
+                    ("op", op.into()),
+                    (
+                        "paths",
+                        Value::List(vec![b"renamed/nested/internal".to_vec().into()]),
+                    ),
+                ])
+            };
+            c.request(&request, |_| panic!("excluded descendant leaked"))
+                .unwrap();
+        }
+        drop(c);
+        let c = Catalog::open(r.path(), &db, vec![path]).unwrap();
+        assert!(scan(&c).is_empty());
+    }
+
+    #[test]
+    fn exclusions_created_after_enrollment_retain_identity_when_renamed() {
+        let r = tempfile::tempdir().unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let path = r.path().join("future-state");
+        let c = Catalog::open(
+            r.path(),
+            &d.path().join("catalog.sqlite3"),
+            vec![path.clone()],
+        )
+        .unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("internal"), b"state").unwrap();
+        assert!(scan(&c).is_empty());
+        fs::rename(&path, r.path().join("renamed-state")).unwrap();
+        assert!(scan(&c).is_empty());
     }
     #[test]
     fn indexed_rows_without_enrollment_are_never_adopted() {
