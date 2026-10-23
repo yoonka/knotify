@@ -37,9 +37,6 @@ impl From<i64> for Value {
     }
 }
 impl Value {
-    pub fn map(items: impl IntoIterator<Item = (impl Into<String>, Value)>) -> Self {
-        Self::Map(items.into_iter().map(|(k, v)| (k.into(), v)).collect())
-    }
     pub fn get(&self, key: &str) -> io::Result<&Self> {
         match self {
             Self::Map(m) => m.get(key).ok_or_else(invalid),
@@ -56,13 +53,6 @@ impl Value {
     pub fn int(&self) -> io::Result<i64> {
         if let Self::Int(v) = self {
             Ok(*v)
-        } else {
-            Err(invalid())
-        }
-    }
-    pub fn list(&self) -> io::Result<&[Self]> {
-        if let Self::List(v) = self {
-            Ok(v)
         } else {
             Err(invalid())
         }
@@ -133,12 +123,6 @@ fn encode_value(value: &Value, out: &mut Vec<u8>, depth: usize) -> io::Result<()
 }
 pub fn decode(bytes: &[u8]) -> io::Result<Value> {
     decode_bounded(bytes, MAX_ITEMS)
-}
-// Only for migrating the old local exclusion blob. Its encoder bounded bytes,
-// but not item count. Keep all packet limits unchanged; new policy state is
-// stored as SQLite rows and never uses this decoder.
-pub(crate) fn decode_legacy_exclusions(bytes: &[u8]) -> io::Result<Value> {
-    decode_bounded(bytes, bytes.len())
 }
 fn decode_bounded(bytes: &[u8], budget: usize) -> io::Result<Value> {
     if bytes.len() > MAX_PACKET || bytes.first() != Some(&131) {
@@ -285,22 +269,5 @@ mod tests {
         let mut b = encode(&v).unwrap();
         b.push(0);
         assert!(decode(&b).is_err());
-    }
-    #[test]
-    fn legacy_policy_migration_does_not_relax_packet_limits() {
-        let value = Value::List(
-            (0..1700)
-                .map(|_| Value::map([("volume", vec![1; 8].into()), ("ino", vec![2; 16].into())]))
-                .collect(),
-        );
-        let bytes = encode(&value).unwrap();
-        assert!(decode(&bytes).is_err());
-        assert_eq!(decode_legacy_exclusions(&bytes).unwrap(), value);
-        assert!(
-            read(&mut std::io::Cursor::new(
-                [(bytes.len() as u32).to_be_bytes().as_slice(), &bytes].concat()
-            ))
-            .is_err()
-        );
     }
 }

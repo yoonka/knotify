@@ -1,4 +1,4 @@
-name: Native protocol and reconciliation
+name: Watcher protocol and platform compatibility
 on: [push, pull_request]
 permissions:
   contents: read

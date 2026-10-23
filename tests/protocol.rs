@@ -1,120 +1,38 @@
 #[path = "../src/wire.rs"]
+#[allow(dead_code)]
 mod wire;
 use std::{
-    io,
-    process::{Child, ChildStdin, Command, Stdio},
-    sync::mpsc,
+    process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
-use wire::Value;
-
-struct Service {
-    child: Child,
-    input: Option<ChildStdin>,
-    messages: mpsc::Receiver<io::Result<Value>>,
-}
-impl Service {
-    fn open(root: &std::path::Path, database: &std::path::Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_knotify"))
-            .arg("catalog")
-            .arg("--root")
-            .arg(root)
-            .arg("--database")
-            .arg(database)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let input = child.stdin.take();
-        let mut output = child.stdout.take().unwrap();
-        let (tx, messages) = mpsc::channel();
-        thread::spawn(move || {
-            loop {
-                match wire::read(&mut output) {
-                    Ok(Some(v)) => {
-                        if tx.send(Ok(v)).is_err() {
-                            return;
-                        }
-                    }
-                    Ok(None) => return,
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                        return;
-                    }
-                }
-            }
-        });
-        Self {
-            child,
-            input,
-            messages,
-        }
-    }
-    fn read(&self) -> Value {
-        self.messages
-            .recv_timeout(Duration::from_secs(10))
-            .unwrap()
-            .unwrap()
-    }
-    fn send(&mut self, op: &str, id: i64) {
-        let v = Value::map([
-            ("version", 1.into()),
-            ("id", id.into()),
-            ("op", op.into()),
-            ("path", Vec::<u8>::new().into()),
-        ]);
-        wire::write(self.input.as_mut().unwrap(), &v).unwrap();
-    }
-    fn close(&mut self) {
-        self.input.take();
+#[test]
+fn hint_service_reports_readiness_and_exits_when_its_owner_closes() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_knotify"))
+        .args(["--protocol", "etf", "--recursive", "--path"])
+        .arg(root.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let ready = wire::read(child.stdout.as_mut().unwrap()).unwrap().unwrap();
+        assert_eq!(ready.get("type").unwrap().bytes().unwrap(), b"ready");
+        child.stdin.take();
         let started = Instant::now();
         loop {
-            if self.child.try_wait().unwrap().is_some() {
-                return;
+            if child.try_wait().unwrap().is_some() {
+                break;
             }
             assert!(
                 started.elapsed() < Duration::from_secs(5),
-                "port did not exit on EOF"
+                "watcher did not exit on EOF"
             );
             thread::sleep(Duration::from_millis(10));
         }
-    }
-}
-impl Drop for Service {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-#[test]
-fn catalog_batches_wait_for_acknowledgement_and_eof_stops_blocked_work() {
-    let root = tempfile::tempdir().unwrap();
-    let data = tempfile::tempdir().unwrap();
-    for i in 0..300 {
-        std::fs::write(root.path().join(format!("file-{i}")), b"x").unwrap();
-    }
-    let mut service = Service::open(root.path(), &data.path().join("catalog.sqlite3"));
-    assert_eq!(
-        service.read().get("type").unwrap().bytes().unwrap(),
-        b"ready"
-    );
-    service.send("reconcile_dir", 1);
-    let batch = service.read();
-    assert_eq!(batch.get("id").unwrap().int().unwrap(), 1);
-    assert_eq!(batch.get("type").unwrap().bytes().unwrap(), b"batch");
-    assert!(batch.get("items").unwrap().list().unwrap().len() <= 128);
-    assert!(
-        service
-            .messages
-            .recv_timeout(Duration::from_millis(150))
-            .is_err()
-    );
-    service.send("ack", 1);
-    assert_eq!(
-        service.read().get("type").unwrap().bytes().unwrap(),
-        b"batch"
-    );
-    service.close();
+    }));
+    let _ = child.kill();
+    let _ = child.wait();
+    guarded.unwrap();
 }
