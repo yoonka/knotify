@@ -1,5 +1,8 @@
 # knotify
 
+For the opt-in lossless ETF watcher, see
+[the protocol guide](docs/protocol.md). The legacy JSON CLI remains available.
+
 A cross-platform file system watcher utility built with Rust that monitors file and directory changes in real-time.
 
 ## Overview
@@ -27,7 +30,7 @@ knotify is a command-line tool that watches specified files and directories for 
 
 ```bash
 # Clone the repository
-git clone 
+git clone
 
 # Build the project
 cargo build --release

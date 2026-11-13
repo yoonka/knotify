@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use clap::Parser;
+use std::path::PathBuf;
 
 /// CLI argument parser
 #[derive(Parser, Debug)]
@@ -8,6 +8,10 @@ pub struct Args {
     /// One or more paths to watch
     #[arg(long, required = true)]
     pub path: Vec<PathBuf>,
+
+    /// Opt-in lossless, credit-controlled path-hint protocol (json or etf)
+    #[arg(long, default_value = "json", value_parser = ["json", "etf"])]
+    pub protocol: String,
 
     /// Watch directories recursively
     #[arg(long, default_value_t = false)]

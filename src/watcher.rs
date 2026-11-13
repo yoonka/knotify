@@ -3,9 +3,9 @@ use crate::config::{Config, EventFilter};
 use notify::{Event, EventKind, RecursiveMode, Result, Watcher};
 use serde_json::json;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -74,9 +74,8 @@ impl EventCache {
         let event_class = EventClass::from_kind_str(&kind);
 
         // Clean up expired entries
-        self.cache.retain(|_, &mut timestamp| {
-            now.duration_since(timestamp) < self.debounce_duration
-        });
+        self.cache
+            .retain(|_, &mut timestamp| now.duration_since(timestamp) < self.debounce_duration);
         self.last_event_per_path.retain(|_, last_event| {
             now.duration_since(last_event.timestamp) < self.debounce_duration
         });
@@ -108,11 +107,14 @@ impl EventCache {
         }
 
         // Update tracking for this path
-        self.last_event_per_path.insert(path.clone(), LastEvent {
-            kind: kind.clone(),
-            class: event_class,
-            timestamp: now,
-        });
+        self.last_event_per_path.insert(
+            path.clone(),
+            LastEvent {
+                kind: kind.clone(),
+                class: event_class,
+                timestamp: now,
+            },
+        );
 
         // Also update the exact event cache
         let event_key = EventKey { path, kind };
@@ -122,15 +124,104 @@ impl EventCache {
     }
 }
 
+/// Some backends report generic create/remove kinds, including Windows.
+/// Remember directory names while they exist so removal can still be typed.
+#[derive(Default)]
+struct DirectoryKinds {
+    paths: HashSet<PathBuf>,
+}
+
+impl DirectoryKinds {
+    fn record_tree(&mut self, root: &Path, recursive: bool) {
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(path) = pending.pop() {
+            let Ok(metadata) = path.symlink_metadata() else {
+                continue;
+            };
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                continue;
+            }
+            self.paths.insert(path.clone());
+            if recursive {
+                if let Ok(entries) = path.read_dir() {
+                    pending.extend(entries.filter_map(|entry| entry.ok().map(|e| e.path())));
+                }
+            }
+        }
+    }
+
+    fn forget_tree(&mut self, root: &Path) {
+        self.paths.retain(|path| !path.starts_with(root));
+    }
+
+    fn observe(&mut self, event: &mut Event, recursive: bool) {
+        use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
+
+        match event.kind {
+            EventKind::Create(kind) => {
+                if kind == CreateKind::Any {
+                    if let Some(metadata) =
+                        event.paths.first().and_then(|p| p.symlink_metadata().ok())
+                    {
+                        event.kind = EventKind::Create(if metadata.is_dir() {
+                            CreateKind::Folder
+                        } else {
+                            CreateKind::File
+                        });
+                    }
+                }
+                for path in &event.paths {
+                    self.record_tree(path, recursive);
+                }
+            }
+            EventKind::Remove(kind) => {
+                if kind == RemoveKind::Any
+                    && event.paths.first().is_some_and(|p| self.paths.contains(p))
+                {
+                    event.kind = EventKind::Remove(RemoveKind::Folder);
+                }
+                for path in &event.paths {
+                    self.forget_tree(path);
+                }
+            }
+            EventKind::Modify(ModifyKind::Name(mode)) => {
+                if matches!(mode, RenameMode::From | RenameMode::Any) {
+                    if let Some(path) = event.paths.first() {
+                        if !path.exists() && self.paths.contains(path) {
+                            event.kind = EventKind::Remove(RemoveKind::Folder);
+                        }
+                        self.forget_tree(path);
+                    }
+                } else if mode == RenameMode::Both {
+                    if let Some(path) = event.paths.first() {
+                        self.forget_tree(path);
+                    }
+                }
+                if mode != RenameMode::From {
+                    for path in &event.paths {
+                        self.record_tree(path, recursive);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub struct Watchman {
     config: Config,
     event_cache: RefCell<EventCache>,
+    directory_kinds: RefCell<DirectoryKinds>,
 }
 
 impl Watchman {
     pub fn new(config: Config) -> Result<Self> {
         let event_cache = RefCell::new(EventCache::new(config.debounce_ms));
-        Ok(Watchman { config, event_cache })
+        Ok(Watchman {
+            config,
+            event_cache,
+            directory_kinds: RefCell::default(),
+        })
     }
 
     pub fn recursive_mode(&self) -> RecursiveMode {
@@ -168,7 +259,7 @@ impl Watchman {
                 }
             }
             EventKind::Modify(modify_kind) => {
-                use notify::event::{ModifyKind, DataChange, RenameMode};
+                use notify::event::{DataChange, ModifyKind, RenameMode};
                 match modify_kind {
                     ModifyKind::Data(DataChange::Content) => "MODIFY_CONTENT",
                     ModifyKind::Data(DataChange::Size) => "MODIFY_SIZE",
@@ -204,7 +295,12 @@ impl Watchman {
         Some(kind_str.to_string())
     }
 
-    fn handle_event(&self, event: Event) -> Result<()> {
+    fn handle_event(&self, mut event: Event) -> Result<()> {
+        // Track kinds before filtering: a create may be needed to type a later
+        // removal even when the caller only subscribes to removals.
+        self.directory_kinds
+            .borrow_mut()
+            .observe(&mut event, self.config.recursive);
         // Check if this event should be processed based on filters
         if !self.should_process_event(&event.kind) {
             return Ok(());
@@ -219,7 +315,11 @@ impl Watchman {
         // For events with multiple paths, check each path separately
         for path in &event.paths {
             // Use the new API: pass path and kind directly
-            if !self.event_cache.borrow_mut().should_process(path.clone(), kind_str.clone()) {
+            if !self
+                .event_cache
+                .borrow_mut()
+                .should_process(path.clone(), kind_str.clone())
+            {
                 // Skip this entire event if any path is a duplicate or spurious
                 return Ok(());
             }
@@ -250,7 +350,7 @@ impl Watchman {
                 }
             }
             EventKind::Modify(modify_kind) => {
-                use notify::event::{ModifyKind, DataChange, RenameMode};
+                use notify::event::{DataChange, ModifyKind, RenameMode};
                 match modify_kind {
                     ModifyKind::Data(DataChange::Content) => "MODIFY_CONTENT",
                     ModifyKind::Data(DataChange::Size) => "MODIFY_SIZE",
@@ -317,6 +417,12 @@ impl Watchman {
             watcher.watch(path, self.recursive_mode())?;
         }
 
+        for path in &self.config.paths {
+            self.directory_kinds
+                .borrow_mut()
+                .record_tree(path, self.config.recursive);
+        }
+
         for res in rx {
             match res {
                 Ok(event) => self.handle_event(event)?,
@@ -325,5 +431,68 @@ impl Watchman {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
+
+    #[test]
+    fn generic_folder_events_keep_their_type_after_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("folder");
+        std::fs::create_dir(&path).unwrap();
+        let mut kinds = DirectoryKinds::default();
+        let mut created = Event::new(EventKind::Create(CreateKind::Any)).add_path(path.clone());
+        kinds.observe(&mut created, true);
+        assert_eq!(created.kind, EventKind::Create(CreateKind::Folder));
+
+        std::fs::remove_dir(&path).unwrap();
+        let mut removed = Event::new(EventKind::Remove(RemoveKind::Any)).add_path(path.clone());
+        kinds.observe(&mut removed, true);
+        assert_eq!(removed.kind, EventKind::Remove(RemoveKind::Folder));
+        assert!(!kinds.paths.contains(&path));
+    }
+
+    #[test]
+    fn startup_and_moved_in_trees_preserve_nested_directory_kinds() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("old");
+        std::fs::create_dir_all(old.join("nested")).unwrap();
+        let mut kinds = DirectoryKinds::default();
+        kinds.record_tree(root.path(), true);
+
+        let new = root.path().join("new");
+        std::fs::rename(&old, &new).unwrap();
+        let mut renamed = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(old.clone())
+            .add_path(new.clone());
+        kinds.observe(&mut renamed, true);
+        assert!(!kinds.paths.contains(&old));
+        assert!(kinds.paths.contains(&new.join("nested")));
+
+        std::fs::remove_dir(new.join("nested")).unwrap();
+        let mut removed =
+            Event::new(EventKind::Remove(RemoveKind::Any)).add_path(new.join("nested"));
+        kinds.observe(&mut removed, true);
+        assert_eq!(removed.kind, EventKind::Remove(RemoveKind::Folder));
+    }
+
+    #[test]
+    fn generic_file_events_are_not_classified_as_folders() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        std::fs::write(&path, "content").unwrap();
+        let mut kinds = DirectoryKinds::default();
+        kinds.record_tree(root.path(), true);
+        let mut created = Event::new(EventKind::Create(CreateKind::Any)).add_path(path.clone());
+        kinds.observe(&mut created, true);
+        assert_eq!(created.kind, EventKind::Create(CreateKind::File));
+        std::fs::remove_file(&path).unwrap();
+        let mut removed = Event::new(EventKind::Remove(RemoveKind::Any)).add_path(path);
+        kinds.observe(&mut removed, true);
+        assert_eq!(removed.kind, EventKind::Remove(RemoveKind::Any));
     }
 }
