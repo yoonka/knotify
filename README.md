@@ -377,7 +377,7 @@ If experiencing high CPU usage:
 
 ## License
 
-[Add your license information here]
+BSD 3-Clause License. See [LICENSE](LICENSE).
 
 ## Contributing
 
