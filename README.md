@@ -55,6 +55,19 @@ received.
 Each program's README lists its operations. knotify has a protocol of its
 own, described in [`knotify/docs/protocol.md`](knotify/docs/protocol.md).
 
+## Versions and releases
+
+Every project in this repository has the same version, and a release is a
+tag `vX.Y.Z` of the whole repository.
+
+- The release workflow builds knotify for Linux, macOS, Windows and
+  FreeBSD, and attaches the archives and their checksums to the GitHub
+  release.
+- duckport, oxiport and tantiport are not released as binaries; build them
+  from source as described above.
+- The Elixir packages are published to Hex from their directories with
+  `mix hex.publish`.
+
 ## License
 
 BSD 3-Clause License, see [LICENSE](LICENSE). It covers everything in this

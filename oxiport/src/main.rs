@@ -18,7 +18,7 @@ use spargeo::GEOSPARQL_EXTENSION_FUNCTIONS;
 #[derive(Parser, Debug)]
 #[clap(
     name = "oxiport",
-    version = "0.1.0",
+    version,
     about = "Interactive CLI for Oxigraph"
 )]
 struct Cli {
