@@ -47,7 +47,8 @@ defmodule JsonlPort.MixProject do
       licenses: ["BSD-3-Clause"],
       links: %{
         "GitHub" => @source_url
-      }
+      },
+      maintainers: ["Ahmed Lukman"]
     ]
   end
 
