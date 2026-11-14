@@ -1,6 +1,6 @@
 [package]
 name = "oxiport"
-version = "0.1.0"
+version = "1.1.0"
 edition = "2024"
 license = "BSD-3-Clause"
 
@@ -8,8 +8,8 @@ license = "BSD-3-Clause"
 anyhow = "1.0"
 serde_json = "1"
 clap = { version = "4.0", features = ["derive"] }
-oxigraph = "0.4.11"
-spargeo = { version = "0.1.8", optional = true }
+oxigraph = "0.5.13"
+spargeo = { version = "0.5.7", optional = true }
 
 [features]
 default = ["geosparql"]

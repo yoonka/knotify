@@ -2,7 +2,9 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use oxigraph::io::{RdfFormat, RdfSerializer};
 use oxigraph::sparql::results::{QueryResultsFormat, QueryResultsSerializer};
-use oxigraph::sparql::{Query, QueryOptions, QueryResults, Update};
+use oxigraph::sparql::{
+    BoundPreparedSparqlQuery, QueryEvaluationError, QueryExplanation, QueryResults, SparqlEvaluator,
+};
 use oxigraph::store::Store;
 use std::ffi::OsStr;
 use std::fs::{self, File};
@@ -11,12 +13,12 @@ use std::path::Path;
 mod protocol;
 
 #[cfg(feature = "geosparql")]
-use spargeo::register_geosparql_functions;
+use spargeo::GEOSPARQL_EXTENSION_FUNCTIONS;
 
 #[derive(Parser, Debug)]
 #[clap(
     name = "oxiport",
-    version = "0.1.0",
+    version,
     about = "Interactive CLI for Oxigraph"
 )]
 struct Cli {
@@ -160,17 +162,17 @@ fn handle_query(
     } else {
         io::read_to_string(stdin().lock())?
     };
-    let mut query = Query::parse(&query, query_base)?;
+    let mut query = sparql_evaluator(query_base)?.parse_query(&query)?;
     if union_default_graph {
         query.dataset_mut().set_default_graph_as_union();
     }
     // Execute the query using either the provided store or by opening a new one
     let (results, explanation) = if let Some(store) = store {
-        store.explain_query_opt(query, default_query_options(), stats)?
+        run_query(query.on_store(store), stats)
     } else {
         // We already validated that location is Some if store is None
         let store = Store::open_read_only(location.unwrap())?;
-        store.explain_query_opt(query, default_query_options(), stats)?
+        run_query(query.on_store(&store), stats)
     };
     let print_result = (|| {
         match results? {
@@ -315,26 +317,47 @@ fn handle_update(
     } else {
         io::read_to_string(stdin().lock())?
     };
-    let update = Update::parse(&update, update_base)?;
+    let update = sparql_evaluator(update_base)?.parse_update(&update)?;
     if let Some(store) = store {
-        store.update_opt(update, default_query_options())?;
+        update.on_store(store).execute()?;
         store.flush()?;
     } else {
         let store = Store::open(location.unwrap())?;
-        store.update_opt(update, default_query_options())?;
+        update.on_store(&store).execute()?;
         store.flush()?;
     }
 
     Ok(())
 }
 
-fn default_query_options() -> QueryOptions {
-    let mut options = QueryOptions::default();
-    #[cfg(feature = "geosparql")]
-    {
-        options = register_geosparql_functions(options);
+/// The evaluator for queries and updates: the base IRI, if given, and the
+/// GeoSPARQL functions with the geosparql feature.
+fn sparql_evaluator(base_iri: Option<&str>) -> anyhow::Result<SparqlEvaluator> {
+    let mut evaluator = SparqlEvaluator::new();
+    if let Some(base_iri) = base_iri {
+        evaluator = evaluator.with_base_iri(base_iri)?;
     }
-    options
+    #[cfg(feature = "geosparql")]
+    for (name, function) in GEOSPARQL_EXTENSION_FUNCTIONS {
+        evaluator = evaluator.with_custom_function(name.into_owned(), function);
+    }
+    Ok(evaluator)
+}
+
+/// Runs a query and returns its results with the explanation of the plan,
+/// including execution statistics if asked for.
+fn run_query(
+    query: BoundPreparedSparqlQuery<'static>,
+    stats: bool,
+) -> (
+    Result<QueryResults<'static>, QueryEvaluationError>,
+    QueryExplanation,
+) {
+    if stats {
+        query.compute_statistics().explain()
+    } else {
+        query.explain()
+    }
 }
 
 fn format_from_path<T>(

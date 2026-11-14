@@ -109,7 +109,9 @@ pub fn run() -> Result<()> {
                     let mut rows = vec![];
                     for (_, address) in searcher.search(
                         &BooleanQuery::new(clauses),
-                        &TopDocs::with_limit(limit).and_offset(offset),
+                        &TopDocs::with_limit(limit)
+                            .and_offset(offset)
+                            .order_by_score(),
                     )? {
                         let d = searcher.doc::<TantivyDocument>(address)?;
                         let mut m: Value = serde_json::from_str(

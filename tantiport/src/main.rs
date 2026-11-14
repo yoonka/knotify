@@ -118,7 +118,8 @@ fn main() -> tantivy::Result<()> {
 
         if let Ok(query) = query_parser.parse_query(&request.query) {
             let searcher = reader.searcher();
-            if let Ok(top_docs) = searcher.search(&query, &TopDocs::with_limit(10)) {
+            if let Ok(top_docs) = searcher.search(&query, &TopDocs::with_limit(10).order_by_score())
+            {
                 for (_score, doc_address) in top_docs {
                     if let Ok(retrieved_doc) = searcher.doc::<TantivyDocument>(doc_address) {
                         if retrieved_doc.get_first(title).is_some() {

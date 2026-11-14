@@ -10,8 +10,14 @@ Erlang or Elixir application can run it as a port.
 cargo build --release
 ```
 
-DuckDB is compiled from source (the duckdb crate's `bundled` feature),
-which needs a C++ compiler and takes a while.
+DuckDB 2.0 is compiled from source (the duckdb crate's `bundled` feature),
+which needs a C++ compiler and takes a while. The crate's default features
+are off: they would only download a prebuilt library, which the bundled
+build does not use.
+
+DuckDB 2.0 opens database files written by DuckDB 1.x and keeps their
+format, so they stay readable by 1.x. New files get the 2.0 format, which
+DuckDB 1.x cannot read.
 
 ## Line mode
 

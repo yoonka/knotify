@@ -2,7 +2,7 @@
 use anyhow::{Result, anyhow};
 use oxigraph::{
     sparql::results::{QueryResultsFormat, QueryResultsSerializer},
-    sparql::{Query, QueryResults, Update},
+    sparql::{QueryResults, SparqlEvaluator},
     store::Store,
 };
 use serde_json::{Value, json};
@@ -39,22 +39,26 @@ pub fn run() -> Result<()> {
                     Ok(json!({"protocol":1,"operations":["query","update"],"durable":true}))
                 }
                 "update" => {
-                    store.update(Update::parse(
-                        p["sparql"]
-                            .as_str()
-                            .ok_or_else(|| anyhow!("missing_sparql"))?,
-                        None,
-                    )?)?;
+                    SparqlEvaluator::new()
+                        .parse_update(
+                            p["sparql"]
+                                .as_str()
+                                .ok_or_else(|| anyhow!("missing_sparql"))?,
+                        )?
+                        .on_store(&store)
+                        .execute()?;
                     store.flush()?;
                     Ok(json!({"committed":true}))
                 }
                 "query" => {
-                    let results = store.query(Query::parse(
-                        p["sparql"]
-                            .as_str()
-                            .ok_or_else(|| anyhow!("missing_sparql"))?,
-                        None,
-                    )?)?;
+                    let results = SparqlEvaluator::new()
+                        .parse_query(
+                            p["sparql"]
+                                .as_str()
+                                .ok_or_else(|| anyhow!("missing_sparql"))?,
+                        )?
+                        .on_store(&store)
+                        .execute()?;
                     let mut bytes = vec![];
                     match results {
                         QueryResults::Solutions(rows) => {
