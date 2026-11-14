@@ -1,5 +1,10 @@
 name: knotify
-on: [push, pull_request]
+on:
+  push:
+    branches: [master]
+    paths: ['knotify/**', '.github/workflows/knotify.yml']
+  pull_request:
+    paths: ['knotify/**', '.github/workflows/knotify.yml']
 permissions:
   contents: read
 jobs:

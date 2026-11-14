@@ -1,0 +1,29 @@
+name: oxiport
+on:
+  push:
+    branches: [master]
+    paths: ['oxiport/**', '.github/workflows/oxiport.yml']
+  pull_request:
+    paths: ['oxiport/**', '.github/workflows/oxiport.yml']
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: oxiport
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: oxiport
+      # RocksDB's bindings are generated with bindgen, which needs libclang.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+      - run: cargo test --locked

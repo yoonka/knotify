@@ -1,0 +1,26 @@
+name: duckport
+on:
+  push:
+    branches: [master]
+    paths: ['duckport/**', '.github/workflows/duckport.yml']
+  pull_request:
+    paths: ['duckport/**', '.github/workflows/duckport.yml']
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: duckport
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: duckport
+      - run: cargo test --locked
