@@ -29,8 +29,9 @@ knotify is a command-line tool that watches specified files and directories for 
 ### Building from source
 
 ```bash
-# Clone the repository
-git clone
+# Clone the repository; knotify is in its knotify/ directory
+git clone https://github.com/yoonka/beamports.git
+cd beamports/knotify
 
 # Build the project
 cargo build --release
@@ -380,7 +381,7 @@ If experiencing high CPU usage:
 
 ## License
 
-BSD 3-Clause License. See [LICENSE](LICENSE).
+BSD 3-Clause License. See [LICENSE](../LICENSE).
 
 ## Contributing
 

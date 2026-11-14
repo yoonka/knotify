@@ -35,6 +35,9 @@ jobs:
   build-linux:
     name: Build Linux
     needs: create-release
+    defaults:
+      run:
+        working-directory: knotify
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -88,6 +91,9 @@ jobs:
   build-macos:
     name: Build macOS
     needs: create-release
+    defaults:
+      run:
+        working-directory: knotify
     runs-on: macos-latest
     strategy:
       matrix:
@@ -134,6 +140,9 @@ jobs:
   build-windows:
     name: Build Windows
     needs: create-release
+    defaults:
+      run:
+        working-directory: knotify
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -180,6 +189,9 @@ jobs:
   build-freebsd:
     name: Build FreeBSD
     needs: create-release
+    defaults:
+      run:
+        working-directory: knotify
     runs-on: ubuntu-latest
     strategy:
       matrix:

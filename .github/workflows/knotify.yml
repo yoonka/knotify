@@ -1,9 +1,12 @@
-name: Watcher protocol and platform compatibility
+name: knotify
 on: [push, pull_request]
 permissions:
   contents: read
 jobs:
   native:
+    defaults:
+      run:
+        working-directory: knotify
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
@@ -23,6 +26,7 @@ jobs:
           prepare: pkg install -y rust
           run: |
             set -eu
+            cd knotify
             kldload zfs || true
             truncate -s 1G /tmp/knotify-test.vdev
             zpool create -m /tmp/knotify-zfs knotify_test /tmp/knotify-test.vdev
