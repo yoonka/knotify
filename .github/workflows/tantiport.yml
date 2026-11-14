@@ -1,0 +1,26 @@
+name: tantiport
+on:
+  push:
+    branches: [master]
+    paths: ['tantiport/**', '.github/workflows/tantiport.yml']
+  pull_request:
+    paths: ['tantiport/**', '.github/workflows/tantiport.yml']
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: tantiport
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tantiport
+      - run: cargo test --locked

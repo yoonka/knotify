@@ -1,0 +1,40 @@
+name: knotify_ex
+on:
+  push:
+    branches: [master]
+    paths: ['knotify/**', 'knotify_ex/**', '.github/workflows/knotify_ex.yml']
+  pull_request:
+    paths: ['knotify/**', 'knotify_ex/**', '.github/workflows/knotify_ex.yml']
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - elixir: '1.16'
+            otp: '26'
+          - elixir: '1.19'
+            otp: '28'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: knotify
+      # The tests run the knotify built from this commit.
+      - run: cargo build --release --locked
+        working-directory: knotify
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+      - run: mix deps.get
+        working-directory: knotify_ex
+      - run: |
+          export PATH="$GITHUB_WORKSPACE/knotify/target/release:$PATH"
+          export KNOTIFY_TEST_EXECUTABLE="$GITHUB_WORKSPACE/knotify/target/release/knotify"
+          mix test
+        working-directory: knotify_ex

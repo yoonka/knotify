@@ -1,0 +1,30 @@
+name: duckport
+on:
+  push:
+    branches: [master]
+    paths: ['duckport/**', '.github/workflows/duckport.yml']
+  pull_request:
+    paths: ['duckport/**', '.github/workflows/duckport.yml']
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # DuckDB 1.4.1's bundled C++ (its copy of fmt) does not build with
+        # Visual Studio 2026 (MSVC 14.51, windows-latest since autumn 2026),
+        # whose STL dropped stdext::checked_array_iterator. Keep Visual Studio
+        # 2022 until duckport moves to a DuckDB that builds with it.
+        os: [ubuntu-latest, windows-2022]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: duckport
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: duckport
+      - run: cargo test --locked

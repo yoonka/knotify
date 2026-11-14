@@ -1,9 +1,17 @@
-name: Watcher protocol and platform compatibility
-on: [push, pull_request]
+name: knotify
+on:
+  push:
+    branches: [master]
+    paths: ['knotify/**', '.github/workflows/knotify.yml']
+  pull_request:
+    paths: ['knotify/**', '.github/workflows/knotify.yml']
 permissions:
   contents: read
 jobs:
   native:
+    defaults:
+      run:
+        working-directory: knotify
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
@@ -18,11 +26,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: vmactions/freebsd-vm@v1.5.9
         with:
-          release: '15.0'
+          # The newest 15.x: packages are built for the oldest supported
+          # 15.x, which the newest one runs, but not always the other way.
+          release: '15'
           mem: 4096
           prepare: pkg install -y rust
           run: |
             set -eu
+            cd knotify
             kldload zfs || true
             truncate -s 1G /tmp/knotify-test.vdev
             zpool create -m /tmp/knotify-zfs knotify_test /tmp/knotify-test.vdev
