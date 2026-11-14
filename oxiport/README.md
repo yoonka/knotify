@@ -17,6 +17,15 @@ it (on FreeBSD, `/usr/local/llvm<version>/lib` from devel/llvm). The
 default `geosparql` feature adds the GeoSPARQL functions to the interactive
 mode; `--no-default-features` leaves them out.
 
+On FreeBSD, Oxigraph 0.5.13 does not compile as released: it converts the
+file descriptor limit (`rlim_t`, signed on FreeBSD) with `u64::from`. The
+FreeBSD port of Oxigraph patches that line.
+
+oxiport uses Oxigraph 0.5, and used Oxigraph 0.4 until November 2026.
+The first time Oxigraph 0.5 opens a 0.4 store read-write, it migrates the
+store in place. Oxigraph 0.4 cannot open it afterwards, so keep a copy if
+you may need to go back.
+
 ## Interactive mode
 
 ```sh
