@@ -35,6 +35,8 @@ jobs:
           otp-version: ${{ matrix.otp }}
       # The tests use node (preinstalled on the runners) as a fake program.
       - run: mix deps.get
-      - run: mix format --check-formatted
+      # The Windows checkout has CRLF line endings, which mix format rejects.
+      - if: runner.os != 'Windows'
+        run: mix format --check-formatted
       - run: mix compile --warnings-as-errors
       - run: mix test
