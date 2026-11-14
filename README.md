@@ -10,6 +10,7 @@ independently of the others.
 |---|---|
 | [`knotify/`](knotify/) | File system watcher (Rust's notify crate) reporting changes as JSON or Erlang terms |
 | [`knotify_ex/`](knotify_ex/) | Elixir client for knotify, the Hex package [knotify_ex](https://hex.pm/packages/knotify_ex) |
+| [`jsonl_port/`](jsonl_port/) | Elixir client for programs that speak the `--jsonl` protocol below, the Hex package jsonl_port |
 | [`duckport/`](duckport/) | SQL on a [DuckDB](https://duckdb.org) database |
 | [`oxiport/`](oxiport/) | SPARQL on an [Oxigraph](https://github.com/oxigraph/oxigraph) RDF store |
 | [`tantiport/`](tantiport/) | Full-text search with [Tantivy](https://github.com/quickwit-oss/tantivy) |
@@ -52,7 +53,8 @@ received.
   DuckDB or Tantivy, or flushed by Oxigraph.
 - A line that is not JSON ends the program.
 
-Each program's README lists its operations. knotify has a protocol of its
+Each program's README lists its operations. [`jsonl_port`](jsonl_port/) is
+the Elixir client for the protocol. knotify has a protocol of its
 own, described in [`knotify/docs/protocol.md`](knotify/docs/protocol.md).
 
 ## Versions and releases

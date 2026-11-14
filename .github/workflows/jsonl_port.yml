@@ -1,0 +1,42 @@
+name: jsonl_port
+on:
+  push:
+    branches: [master]
+    paths: ['jsonl_port/**', '.github/workflows/jsonl_port.yml']
+  pull_request:
+    paths: ['jsonl_port/**', '.github/workflows/jsonl_port.yml']
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            elixir: '1.16'
+            otp: '26'
+          - os: ubuntu-latest
+            elixir: '1.19'
+            otp: '28'
+          # Timeouts kill the program with taskkill on Windows.
+          - os: windows-latest
+            elixir: '1.19'
+            otp: '28'
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: jsonl_port
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+      # The tests use node (preinstalled on the runners) as a fake program.
+      - run: mix deps.get
+      # The Windows checkout has CRLF line endings, which mix format rejects.
+      - if: runner.os != 'Windows'
+        run: mix format --check-formatted
+      - run: mix compile --warnings-as-errors
+      - run: mix test
