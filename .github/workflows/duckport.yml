@@ -12,7 +12,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # DuckDB 1.4.1's bundled C++ (its copy of fmt) does not build with
+        # Visual Studio 2026 (MSVC 14.51, windows-latest since autumn 2026),
+        # whose STL dropped stdext::checked_array_iterator. Keep Visual Studio
+        # 2022 until duckport moves to a DuckDB that builds with it.
+        os: [ubuntu-latest, windows-2022]
     runs-on: ${{ matrix.os }}
     defaults:
       run:
